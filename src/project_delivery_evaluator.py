@@ -1278,6 +1278,7 @@ def _get_styles():
     styles['top_left'] = Alignment(horizontal="left", vertical="top", wrap_text=True)
     
     styles['bold'] = Font(bold=True)
+    styles['bold_font'] = styles['bold'] # Alias for legacy/V2 consistency
     styles['blue_bold'] = Font(bold=True, size=11, color="0000FF")
     styles['italic_small'] = Font(italic=True, size=9)
     styles['bold_12'] = Font(bold=True, size=12)
@@ -1676,8 +1677,12 @@ def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_met
     ws.column_dimensions['A'].width = 75
     ws.column_dimensions['B'].width = 25
     for ci in range(len(methods)):
-        col_letter = get_column_letter(3 + ci*2 + 1)
-        ws.column_dimensions[col_letter].width = 15.0
+        # Column C=3, D=4, E=5, F=6, G=7, H=8, I=9, J=10, K=11, L=12, M=13, N=14
+        # Method 1 (ci=0) should be C & D (3 & 4)
+        # Method 2 (ci=1) should be E & F (5 & 6)
+        col_idx = 3 + ci*2
+        ws.column_dimensions[get_column_letter(col_idx)].width = 15.0
+        ws.column_dimensions[get_column_letter(col_idx+1)].width = 15.0
 
     # 1. INSTRUCTIONS
     ws.cell(row=1, column=1, value="INSTRUCTIONS").font = s['bold']
@@ -1696,19 +1701,21 @@ def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_met
     ]
     for i, text in enumerate(instructions, 2):
         cell = ws.cell(row=i, column=1, value=text)
-        cell.font = Font(size=9)
+        cell.font = Font(size=8) # Smaller to fit more
         ws.merge_cells(start_row=i, start_column=1, end_row=i, end_column=14)
     
     curr = 12
     # 2. Project Headers
     tool_title = ws.cell(row=curr, column=4, value="Project Delivery Selection Tool")
-    tool_title.font = Font(bold=True, size=12)
+    tool_title.font = Font(bold=True, size=14)
     tool_title.alignment = s['center']
     ws.merge_cells(start_row=curr, start_column=4, end_row=curr, end_column=10)
+    curr += 1
     
-    ws.cell(row=curr+1, column=4, value="Project Summary Worksheet").font = Font(bold=True, size=11)
-    ws.cell(row=curr+1, column=4).alignment = s['center']
-    ws.merge_cells(start_row=curr+1, start_column=4, end_row=curr+1, end_column=10)
+    ws.cell(row=curr, column=4, value="Project Summary Worksheet").font = Font(bold=True, size=12)
+    ws.cell(row=curr, column=4).alignment = s['center']
+    ws.merge_cells(start_row=curr, start_column=4, end_row=curr, end_column=10)
+    curr += 1
     
     # 2. Project Headers (Identity Table)
     curr += 1
@@ -1745,12 +1752,12 @@ def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_met
     
     # Committee Section
     comm_start = curr
-    ws.cell(row=curr, column=1, value="Selection Committee Members:").font = bold_font
+    ws.cell(row=curr, column=1, value="Selection Committee Members:").font = s['bold']
     ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=4)
     curr += 1
     for i in range(5):
         ws.cell(row=curr, column=1, value=f"{i+1}.").alignment = Alignment(horizontal="right")
-        ws.cell(row=curr, column=2).border = Border(bottom=thin)
+        ws.cell(row=curr, column=2).border = Border(bottom=s['thin_side'])
         ws.merge_cells(start_row=curr, start_column=2, end_row=curr, end_column=4)
         curr += 1
     _apply_outer_border(ws, comm_start, 1, curr-1, 4)
@@ -1781,8 +1788,8 @@ def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_met
         ws.merge_cells(start_row=curr, start_column=col, end_row=curr, end_column=col+1)
     
     # Question column must be wide
-    ws.column_dimensions["A"].width = 5
-    ws.column_dimensions["B"].width = 60
+    ws.column_dimensions["A"].width = 75
+    ws.column_dimensions["B"].width = 25
     
     # Increase row height for project headers to prevent cramping
     for r in range(13, 20):
@@ -1837,9 +1844,9 @@ def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_met
         ws.cell(row=curr, column=col, value=f"☐ {m}").font = Font(size=9)
     curr += 2
     
-    ws.cell(row=curr, column=1, value="Comments:").font = bold_font
+    ws.cell(row=curr, column=1, value="Comments:").font = s['bold']
     for _ in range(4):
-        ws.cell(row=curr, column=2).border = Border(bottom=thin)
+        ws.cell(row=curr, column=2).border = Border(bottom=s['thin_side'])
         ws.merge_cells(start_row=curr, start_column=2, end_row=curr, end_column=14)
         curr += 1
 
@@ -2034,7 +2041,7 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
         c.font = s['bold']
         c.fill = s['header_fill_v2']
         c.alignment = s['center']
-        c.border = box_border
+        c.border = s['bdr']
     curr += 2
 
 def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_method=None, title=None, project_name=None):
@@ -2043,15 +2050,8 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
     ID, Criteria, Rating, Confidence, Source, Missing Info, effect.
     """
     s = _get_styles()
-    thin = s['thin_side']
     
-    # Styles
-    box_border = s['bdr']
-    thin_border = s['thin_side']
-    center_align = s['center']
-    top_left_align = s['top_left']
-    bold_font = s['bold']
-    
+    # Use s directly to avoid NameErrors
     # Theme Colors
     header_fill = s['header_fill_v2']
     grey_fill = s['grey_fill']
@@ -2078,13 +2078,12 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
 
     # 2. Table Headers
     headers = ["ID", "EVALUATION CRITERIA", "RATING", "POINTS", "CONFID.", "SOURCE REASONING", "MISSING INFO", "EFFECT ON METHOD"]
-    s = _get_styles()
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=4, column=ci, value=h)
-        c.font = bold_font
+        c.font = s['bold']
         c.fill = header_fill
         c.alignment = s['center']
-        c.border = box_border
+        c.border = s['bdr']
     
     current_row = 5
     for q in q_list:
@@ -2102,8 +2101,8 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         start_row = current_row
         
         # ID and Criteria
-        ws.cell(row=current_row, column=1, value=qid).font = bold_font
-        ws.cell(row=current_row, column=2, value=q["question"]).font = bold_font
+        ws.cell(row=current_row, column=1, value=qid).font = s['bold']
+        ws.cell(row=current_row, column=2, value=q["question"]).font = s['bold']
         current_row += 1
         
         # Options
@@ -2117,8 +2116,8 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
             
             c_opt = ws.cell(row=current_row, column=2, value=display_text)
             c_opt.font = Font(size=9)
-            c_opt.alignment = top_left_align
-            c_opt.border = Border(left=thin_border, right=thin_border)
+            c_opt.alignment = s['top_left']
+            c_opt.border = Border(left=s['thin_side'], right=s['thin_side'])
             current_row += 1
         
         end_row = current_row - 1
@@ -2136,41 +2135,46 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         rating_color = "166534" if sel_rating == "A" else ("854D0E" if sel_rating == "B" else "991B1B")
         c_rate = ws.cell(row=start_row, column=3, value=sel_rating)
         c_rate.font = Font(bold=True, color=rating_color)
-        c_rate.alignment = center_align
-        c_rate.border = box_border
+        c_rate.alignment = s['center']
+        c_rate.border = s['bdr']
         
         # Points Cell (D)
         c_pts = ws.cell(row=start_row, column=4, value=pts)
-        c_pts.font = bold_font
-        c_pts.alignment = center_align
-        c_pts.border = box_border
+        c_pts.font = s['bold']
+        c_pts.alignment = s['center']
+        c_pts.border = s['bdr']
         
         # Confidence Cell (E)
         c_conf = ws.cell(row=start_row, column=5, value=f"{confidence:.2f}")
-        c_conf.alignment = center_align
-        c_conf.border = box_border
+        c_conf.alignment = s['center']
+        c_conf.border = s['bdr']
         
         # Source Reasoning (F)
         c_src = ws.cell(row=start_row, column=6, value=source_res)
-        c_src.alignment = top_left_align
-        c_src.border = box_border
+        c_src.alignment = s['top_left']
+        c_src.border = s['bdr']
         c_src.font = Font(size=9)
         
         # Missing Info (G)
         c_miss = ws.cell(row=start_row, column=7, value=missing_res)
-        c_miss.alignment = top_left_align
-        c_miss.border = box_border
+        c_miss.alignment = s['top_left']
+        c_miss.border = s['bdr']
         c_miss.font = Font(size=9)
         
         # Effect on Method (H)
         c_eff = ws.cell(row=start_row, column=8, value=effect_res)
-        c_eff.alignment = top_left_align
-        c_eff.border = box_border
+        c_eff.alignment = s['top_left']
+        c_eff.border = s['bdr']
         c_eff.font = Font(size=9)
         
         # Borders for Criteria column (B)
         for r in range(start_row, end_row + 1):
-            ws.cell(row=r, column=2).border = Border(left=thin_border, right=thin_border, top=thin_border if r == start_row else None, bottom=thin_border if r == end_row else None)
+            ws.cell(row=r, column=2).border = Border(
+                left=s['thin_side'], 
+                right=s['thin_side'], 
+                top=s['thin_side'] if r == start_row else None, 
+                bottom=s['thin_side'] if r == end_row else None
+            )
 
         current_row += 1 # Spacer
     ws.column_dimensions["L"].width = 10
@@ -2229,11 +2233,19 @@ def build_evaluation_excel_v2(
     )
     
     # 4. Detailed Method Sheets (The extensions)
+    SAFE_NAME_MAP = {
+        "Design-Bid-Build": "DBB",
+        "Design-Sequencing": "DS",
+        "Design-Build/Low-Bid": "DB-LB",
+        "Design-Build/Best-Value": "DB-BV",
+        "CM/GC": "CM-GC",
+        "Progressive Design-Build": "PDB"
+    }
+
     for method in ALL_METHODS:
-        # Create a safe sheet name (e.g. 'DB-BV Evaluation')
-        safe_name = method.replace("Design-Build/", "DB-").split("/")[0]
-        if len(safe_name) > 20: safe_name = safe_name[:20]
-        m_ws = wb.create_sheet(f"{safe_name} Extension")
+        # Create a safe abbreviation for sheet names
+        short_name = SAFE_NAME_MAP.get(method, method[:10])
+        m_ws = wb.create_sheet(f"{short_name} Extension")
         m_ws.freeze_panes = "C5"
         
         _populate_rubric_sheet(

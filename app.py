@@ -1567,56 +1567,7 @@ if app_option != "Select the Usecase":
                                 else:
                                     section_dominant[sec] = "C"
 
-                        affinity = {
-                            "A": {
-                                "Design-Bid-Build": {"A": 1.0, "B": 0.6, "C": 0.1},
-                                "Design-Sequencing": {"A": 0.8, "B": 0.6, "C": 0.2},
-                                "Design-Build/Low-Bid": {"A": 0.3, "B": 0.5, "C": 0.7},
-                                "Design-Build/Best-Value": {"A": 0.2, "B": 0.5, "C": 0.8},
-                                "CM/GC": {"A": 0.3, "B": 0.6, "C": 0.9},
-                                "Progressive Design-Build": {"A": 0.1, "B": 0.4, "C": 0.9},
-                            },
-                            "B": {
-                                "Design-Bid-Build": {"A": 0.9, "B": 0.5, "C": 0.1},
-                                "Design-Sequencing": {"A": 0.7, "B": 0.5, "C": 0.3},
-                                "Design-Build/Low-Bid": {"A": 0.3, "B": 0.6, "C": 0.8},
-                                "Design-Build/Best-Value": {"A": 0.3, "B": 0.6, "C": 0.8},
-                                "CM/GC": {"A": 0.4, "B": 0.6, "C": 0.8},
-                                "Progressive Design-Build": {"A": 0.3, "B": 0.5, "C": 0.8},
-                            },
-                            "C": {
-                                "Design-Bid-Build": {"A": 0.9, "B": 0.5, "C": 0.1},
-                                "Design-Sequencing": {"A": 0.7, "B": 0.5, "C": 0.2},
-                                "Design-Build/Low-Bid": {"A": 0.4, "B": 0.5, "C": 0.6},
-                                "Design-Build/Best-Value": {"A": 0.2, "B": 0.5, "C": 0.9},
-                                "CM/GC": {"A": 0.3, "B": 0.6, "C": 0.8},
-                                "Progressive Design-Build": {"A": 0.2, "B": 0.5, "C": 0.9},
-                            },
-                            "D": {
-                                "Design-Bid-Build": {"A": 0.8, "B": 0.5, "C": 0.2},
-                                "Design-Sequencing": {"A": 0.7, "B": 0.5, "C": 0.3},
-                                "Design-Build/Low-Bid": {"A": 0.5, "B": 0.5, "C": 0.5},
-                                "Design-Build/Best-Value": {"A": 0.3, "B": 0.5, "C": 0.8},
-                                "CM/GC": {"A": 0.3, "B": 0.6, "C": 0.8},
-                                "Progressive Design-Build": {"A": 0.3, "B": 0.5, "C": 0.8},
-                            },
-                            "E": {
-                                "Design-Bid-Build": {"A": 0.8, "B": 0.6, "C": 0.3},
-                                "Design-Sequencing": {"A": 0.7, "B": 0.5, "C": 0.3},
-                                "Design-Build/Low-Bid": {"A": 0.3, "B": 0.5, "C": 0.7},
-                                "Design-Build/Best-Value": {"A": 0.2, "B": 0.5, "C": 0.7},
-                                "CM/GC": {"A": 0.4, "B": 0.6, "C": 0.7},
-                                "Progressive Design-Build": {"A": 0.2, "B": 0.5, "C": 0.8},
-                            },
-                            "F": {
-                                "Design-Bid-Build": {"A": 0.8, "B": 0.5, "C": 0.1},
-                                "Design-Sequencing": {"A": 0.7, "B": 0.5, "C": 0.2},
-                                "Design-Build/Low-Bid": {"A": 0.4, "B": 0.5, "C": 0.6},
-                                "Design-Build/Best-Value": {"A": 0.3, "B": 0.5, "C": 0.7},
-                                "CM/GC": {"A": 0.5, "B": 0.6, "C": 0.7},
-                                "Progressive Design-Build": {"A": 0.3, "B": 0.5, "C": 0.8},
-                            },
-                        }
+                        from src.project_delivery_evaluator import METHOD_AFFINITY
 
                         # === V2 TEMPLATE UI ===
                         st.markdown("### Project Delivery Selection Tool")
