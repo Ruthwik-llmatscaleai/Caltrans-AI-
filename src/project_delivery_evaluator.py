@@ -1701,13 +1701,20 @@ def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_met
         ("step", "5. Total the scores from Worksheets 1 and 2 in the Scoring Summary section of the Project Summary Worksheet."),
         ("step", "6. Select the project delivery method with the highest score and record any important selection committee comments in the space provided."),
         ("note", "   Note: Complete one project delivery selection questionnaire for each unique project. If multiple project alternatives or subprojects are being considered, complete one questionnaire for each unique variation."),
+        ("empty", ""),
+        ("hdr", "   SCORING LOGIC:"),
+        ("logic", "   • Each question is rated A (High Fit), B (Neutral), or C (Low Fit) based on project data."),
+        ("logic", "   • Each rating maps to a Numerical Affinity (0.0 to 1.0) for every delivery method."),
+        ("logic", "   • Points Scored = Affinity × 5 (Max 5.0 per question). Highest total indicates best fit."),
     ]
 
     for i, (kind, text) in enumerate(instructions, 2):
         cell = ws.cell(row=i, column=1, value=text)
         is_note = (kind == "note")
+        is_logic = (kind in ["logic", "hdr"])
         # Fix I-3: font 9 (was 8); Fix I-5: Note lines italic grey
-        cell.font = Font(size=9, italic=is_note, color="595959" if is_note else "000000")
+        color = "595959" if (is_note or is_logic) else "000000"
+        cell.font = Font(size=9, italic=(is_note or is_logic), bold=(kind == "hdr"), color=color)
         cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="left")
         # Fix I-4: light fill on all instruction rows
         cell.fill = s['even_fill']
@@ -1802,7 +1809,7 @@ def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_met
 
     # ── SCORING SUMMARY TABLE ─────────────────────────────────────────────────
     last_method_col = 3 + len(methods) * 2 - 1
-    sum_hdr = ws.cell(row=curr, column=1, value="SCORING SUMMARY")
+    sum_hdr = ws.cell(row=curr, column=1, value="SCORING SUMMARY (Sum of Points from Detailed Worksheets)")
     sum_hdr.font = Font(bold=True, size=11)
     sum_hdr.alignment = s['center']
     sum_hdr.fill = s['header_fill_v2']
@@ -1839,7 +1846,8 @@ def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_met
         sec = qid[0]
         sel = rating_index.get(qid, {}).get("selected_rating", "B").upper()
         for m in methods:
-            pts = METHOD_AFFINITY.get(sec, {}).get(m, {}).get(sel, 0.5) * 10
+            # Sync with detailed sheets: points = affinity * 5
+            pts = METHOD_AFFINITY.get(sec, {}).get(m, {}).get(sel, 0.5) * 5
             if sec == "A":
                 ws1_scores[m] += pts
             else:
