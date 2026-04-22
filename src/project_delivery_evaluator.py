@@ -1667,190 +1667,229 @@ def _apply_outer_border(ws, start_row, start_col, end_row, end_col):
 
 def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_method_data, eval_data=None, method_labels=None):
     """
-    Specifically populates the 'Project Summary Worksheet' following the provided images.
+    Populates the 'Project Summary Worksheet' - all 15 formatting issues fixed.
+    I-1..I-6: Instructions block header fill, row heights, font size, Note styling, closing border.
+    P-1..P-7: Title full-width, dynamic curr, identity table centered, dynamic row heights.
+    S-1..S-2: EVALUATION FACTORS border connector, method cols 12px.
     """
     s = _get_styles()
     methods = method_labels if method_labels else ALL_METHODS
-    
-    # Column widths for "de-congested" look
-    ws.column_dimensions['A'].width = 75
-    ws.column_dimensions['B'].width = 25
-    for ci in range(len(methods)):
-        # Column C=3, D=4, E=5, F=6, G=7, H=8, I=9, J=10, K=11, L=12, M=13, N=14
-        # Method 1 (ci=0) should be C & D (3 & 4)
-        # Method 2 (ci=1) should be E & F (5 & 6)
-        col_idx = 3 + ci*2
-        ws.column_dimensions[get_column_letter(col_idx)].width = 15.0
-        ws.column_dimensions[get_column_letter(col_idx+1)].width = 15.0
 
-    # 1. INSTRUCTIONS
-    ws.cell(row=1, column=1, value="INSTRUCTIONS").font = s['bold']
-    ws.cell(row=1, column=1).alignment = s['center']
+    # Fix S-2: reduce method cols 15->12px to balance the wide label column
+    ws.column_dimensions['A'].width = 5
+    ws.column_dimensions['B'].width = 55
+    for ci in range(len(methods)):
+        col_idx = 3 + ci * 2
+        ws.column_dimensions[get_column_letter(col_idx)].width = 12.0
+        ws.column_dimensions[get_column_letter(col_idx + 1)].width = 12.0
+
+    # ── INSTRUCTIONS BLOCK ────────────────────────────────────────────────────
+    # Fix I-1: header with fill, covers full width
+    instr_hdr = ws.cell(row=1, column=1, value="INSTRUCTIONS")
+    instr_hdr.font = Font(bold=True, size=10)
+    instr_hdr.alignment = Alignment(horizontal="center", vertical="center")
+    instr_hdr.fill = s['header_fill_v2']
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=14)
-    
+    ws.row_dimensions[1].height = 16
+
     instructions = [
-        "1. On the Project Summary Worksheet, complete the date of the review, project name, and selection committee members.",
-        "2.  Answer all questions on Worksheet 1.  Record the score for each delivery method on the form as indicated.",
-        "Note: if any one of the answers is \"No-Go,\" the delivery method need not be considered further for that project.",
-        "3. After all the questions are answered, total the score for each delivery system and transfer the totals to the Scoring Summary section on the Project Summary Worksheet.",
-        "4. Repeat steps 2 and 3 for Worksheet 2.",
-        "5. Total the scores from Worksheets 1 and 2 the in Scoring Summary section of the Project Summary Worksheet.",
-        "6. Select the project delivery method with the highest score and record any important selection committee comments in the space provided.",
-        "Note: Complete one project delivery selection questionnaire for each unique project. If multiple project alternatives or subprojects are being considered, complete one questionnaire for each unique variation."
+        ("step", "1. On the Project Summary Worksheet, complete the date of the review, project name, and selection committee members."),
+        ("step", "2. Answer all questions on Worksheet 1. Record the score for each delivery method on the form as indicated."),
+        ("note", "   Note: if any one of the answers is \"No-Go,\" the delivery method need not be considered further for that project."),
+        ("step", "3. After all the questions are answered, total the score for each delivery system and transfer the totals to the Scoring Summary section on the Project Summary Worksheet."),
+        ("step", "4. Repeat steps 2 and 3 for Worksheet 2."),
+        ("step", "5. Total the scores from Worksheets 1 and 2 in the Scoring Summary section of the Project Summary Worksheet."),
+        ("step", "6. Select the project delivery method with the highest score and record any important selection committee comments in the space provided."),
+        ("note", "   Note: Complete one project delivery selection questionnaire for each unique project. If multiple project alternatives or subprojects are being considered, complete one questionnaire for each unique variation."),
     ]
-    for i, text in enumerate(instructions, 2):
+
+    for i, (kind, text) in enumerate(instructions, 2):
         cell = ws.cell(row=i, column=1, value=text)
-        cell.font = Font(size=8) # Smaller to fit more
+        is_note = (kind == "note")
+        # Fix I-3: font 9 (was 8); Fix I-5: Note lines italic grey
+        cell.font = Font(size=9, italic=is_note, color="595959" if is_note else "000000")
+        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="left")
+        # Fix I-4: light fill on all instruction rows
+        cell.fill = s['even_fill']
         ws.merge_cells(start_row=i, start_column=1, end_row=i, end_column=14)
-    
-    curr = 12
-    # 2. Project Headers
-    tool_title = ws.cell(row=curr, column=4, value="Project Delivery Selection Tool")
-    tool_title.font = Font(bold=True, size=14)
-    tool_title.alignment = s['center']
-    ws.merge_cells(start_row=curr, start_column=4, end_row=curr, end_column=10)
+        # Fix I-2: explicit row height
+        ws.row_dimensions[i].height = 13
+
+    # Fix I-6: close the instructions block with an outer border
+    last_instr_row = len(instructions) + 1
+    _apply_outer_border(ws, 1, 1, last_instr_row, 14)
+
+    # Fix P-2: dynamic curr, not hardcoded 12
+    curr = last_instr_row + 2
+
+    # ── TITLE ─────────────────────────────────────────────────────────────────
+    # Fix P-1: title spans full sheet width (was cols 4-10 only)
+    title_cell = ws.cell(row=curr, column=1, value="Project Delivery Selection Tool")
+    title_cell.font = Font(bold=True, size=14)
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    ws.row_dimensions[curr].height = 28
     curr += 1
-    
-    ws.cell(row=curr, column=4, value="Project Summary Worksheet").font = Font(bold=True, size=12)
-    ws.cell(row=curr, column=4).alignment = s['center']
-    ws.merge_cells(start_row=curr, start_column=4, end_row=curr, end_column=10)
-    curr += 1
-    
-    # 2. Project Headers (Identity Table)
-    curr += 1
-    # Define identity rows
+
+    sub_cell = ws.cell(row=curr, column=1, value="Project Summary Worksheet")
+    sub_cell.font = Font(bold=True, size=11)
+    sub_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    ws.row_dimensions[curr].height = 20
+    curr += 2
+
+    # ── IDENTITY TABLE ────────────────────────────────────────────────────────
+    # Fix P-3: center the table on the sheet — labels cols 3-4, values cols 5-8
     district = eval_data.get("district", "N/A") if eval_data else "N/A"
     ea_num = eval_data.get("project_ea", "N/A") if eval_data else "N/A"
-    
     identity = [
         ("Project Name:", project_name if project_name else "N/A"),
         ("Project District:", district),
         ("Project EA:", ea_num),
         ("Date of Review:", datetime.date.today().strftime("%m/%d/%y")),
     ]
-    
+
     id_start_row = curr
     for label, val in identity:
-        # Label cell
-        l_cell = ws.cell(row=curr, column=1, value=label)
+        # Fix P-7: row heights set dynamically per actual curr value
+        ws.row_dimensions[curr].height = 20
+        l_cell = ws.cell(row=curr, column=3, value=label)
         l_cell.font = s['bold']
         l_cell.fill = s['grey_fill']
-        l_cell.alignment = Alignment(horizontal="right")
-        
-        # Value cell
-        v_cell = ws.cell(row=curr, column=2, value=val)
-        v_cell.alignment = s['center']
-        ws.merge_cells(start_row=curr, start_column=2, end_row=curr, end_column=4)
+        # Fix P-4: right-aligned label in a narrower label region
+        l_cell.alignment = Alignment(horizontal="right", vertical="center")
+        ws.merge_cells(start_row=curr, start_column=3, end_row=curr, end_column=4)
+
+        v_cell = ws.cell(row=curr, column=5, value=val)
+        v_cell.alignment = Alignment(horizontal="left", vertical="center")
+        v_cell.font = Font(size=10)
+        ws.merge_cells(start_row=curr, start_column=5, end_row=curr, end_column=8)
         curr += 1
-    
-    _apply_outer_border(ws, id_start_row, 1, curr-1, 4)
-    
+
+    _apply_outer_border(ws, id_start_row, 3, curr - 1, 8)
+
+    # Fix P-5: spaced disclaimer with explicit height
     curr += 1
-    ws.cell(row=curr, column=1, value="Review is based on AI evaluation of project documentation").font = Font(italic=True, size=9)
+    disc = ws.cell(row=curr, column=3, value="Review is based on AI evaluation of project documentation")
+    disc.font = Font(italic=True, size=9, color="595959")
+    disc.alignment = Alignment(horizontal="left", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=3, end_row=curr, end_column=8)
+    ws.row_dimensions[curr].height = 16
     curr += 2
-    
-    # Committee Section
+
+    # ── SELECTION COMMITTEE ───────────────────────────────────────────────────
     comm_start = curr
-    ws.cell(row=curr, column=1, value="Selection Committee Members:").font = s['bold']
-    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=4)
+    hdr = ws.cell(row=curr, column=3, value="Selection Committee Members:")
+    hdr.font = s['bold']
+    hdr.alignment = Alignment(horizontal="left", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=3, end_row=curr, end_column=8)
+    ws.row_dimensions[curr].height = 18
     curr += 1
+
     for i in range(5):
-        ws.cell(row=curr, column=1, value=f"{i+1}.").alignment = Alignment(horizontal="right")
-        ws.cell(row=curr, column=2).border = Border(bottom=s['thin_side'])
-        ws.merge_cells(start_row=curr, start_column=2, end_row=curr, end_column=4)
+        ws.row_dimensions[curr].height = 16
+        # Fix P-6: number cell has right border so it visually connects to the line
+        num = ws.cell(row=curr, column=3, value=f"{i + 1}.")
+        num.alignment = Alignment(horizontal="right", vertical="center")
+        num.border = Border(right=s['thin_side'], bottom=s['thin_side'])
+        line = ws.cell(row=curr, column=4, value="")
+        line.border = Border(bottom=s['thin_side'])
+        ws.merge_cells(start_row=curr, start_column=4, end_row=curr, end_column=8)
         curr += 1
-    _apply_outer_border(ws, comm_start, 1, curr-1, 4)
-    
+
+    _apply_outer_border(ws, comm_start, 3, curr - 1, 8)
     curr += 2
-    # 3. SCORING SUMMARY
+
+    # ── SCORING SUMMARY TABLE ─────────────────────────────────────────────────
+    last_method_col = 3 + len(methods) * 2 - 1
     sum_hdr = ws.cell(row=curr, column=1, value="SCORING SUMMARY")
     sum_hdr.font = Font(bold=True, size=11)
     sum_hdr.alignment = s['center']
     sum_hdr.fill = s['header_fill_v2']
-    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=last_method_col)
+    ws.row_dimensions[curr].height = 18
     curr += 1
-    
-    # Method Headers for Summary Table
+
+    # Method header row
     table_start_row = curr
-    ws.cell(row=curr, column=1, value="EVALUATION FACTORS").font = s['bold']
-    ws.cell(row=curr, column=1).alignment = s['center']
-    ws.cell(row=curr, column=1).fill = s['grey_fill']
+    # Fix S-1: EVALUATION FACTORS with right border connecting to method cols
+    ef = ws.cell(row=curr, column=1, value="EVALUATION FACTORS")
+    ef.font = s['bold']
+    ef.alignment = s['center']
+    ef.fill = s['grey_fill']
+    ef.border = Border(right=s['thin_side'], bottom=s['thin_side'])
     ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
+    ws.row_dimensions[curr].height = 30
 
     for ci, method in enumerate(methods):
-        col = 3 + ci*2
-        # Merge two columns for method label
-        h_cell = ws.cell(row=curr, column=col, value=method)
-        h_cell.font = s['bold']
-        h_cell.fill = s['grey_fill']
-        h_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        ws.merge_cells(start_row=curr, start_column=col, end_row=curr, end_column=col+1)
-    
-    # Question column must be wide
-    ws.column_dimensions["A"].width = 75
-    ws.column_dimensions["B"].width = 25
-    
-    # Increase row height for project headers to prevent cramping
-    for r in range(13, 20):
-        ws.row_dimensions[r].height = 25
-    
+        col = 3 + ci * 2
+        hc = ws.cell(row=curr, column=col, value=method)
+        hc.font = s['bold']
+        hc.fill = s['grey_fill']
+        hc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.merge_cells(start_row=curr, start_column=col, end_row=curr, end_column=col + 1)
+
     curr += 1
-    
-    # Pre-calculate scores per worksheet
+
+    # Score calculation
     ws1_scores = {m: 0 for m in methods}
     ws2_scores = {m: 0 for m in methods}
-    
     for q in q_list:
         qid = q["id"]
         sec = qid[0]
         sel = rating_index.get(qid, {}).get("selected_rating", "B").upper()
         for m in methods:
             pts = METHOD_AFFINITY.get(sec, {}).get(m, {}).get(sel, 0.5) * 10
-            if sec == "A": ws1_scores[m] += pts
-            else: ws2_scores[m] += pts
+            if sec == "A":
+                ws1_scores[m] += pts
+            else:
+                ws2_scores[m] += pts
 
     summary_rows = [
         ("Project Scope and Characteristic Score (Worksheet 1)", ws1_scores),
         ("Success Criteria Score (Worksheet 2)", ws2_scores),
-        ("Total Score", None) # Handled separately for styling
+        ("Total Score", None),
     ]
-    
+
     for label, score_dict in summary_rows:
-        label_cell = ws.cell(row=curr, column=1, value=label)
-        label_cell.font = s['bold']
-        label_cell.alignment = Alignment(wrap_text=True, horizontal="left", vertical="center")
+        ws.row_dimensions[curr].height = 20
+        lc = ws.cell(row=curr, column=1, value=label)
+        lc.font = s['bold']
+        lc.alignment = Alignment(wrap_text=True, horizontal="left", vertical="center")
         ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
-        
+
         for ci, m in enumerate(methods):
-            col = 3 + ci*2
+            col = 3 + ci * 2
             val = round(score_dict[m]) if score_dict else round(ws1_scores[m] + ws2_scores[m])
             c = ws.cell(row=curr, column=col, value=val)
             c.font = s['bold']
             c.alignment = s['center']
-            if not score_dict: # Total row
+            if not score_dict:
                 c.fill = s['grey_fill']
-            ws.merge_cells(start_row=curr, start_column=col, end_row=curr, end_column=col+1)
+            ws.merge_cells(start_row=curr, start_column=col, end_row=curr, end_column=col + 1)
         curr += 1
-    
-    # Apply borders to summary table
-    _apply_outer_border(ws, table_start_row, 1, curr-1, 3 + len(methods)*2 - 1)
-    
+
+    _apply_outer_border(ws, table_start_row, 1, curr - 1, last_method_col)
+
     curr += 1
     ws.cell(row=curr, column=1, value="Final Selection:").font = s['bold']
     curr += 1
+    ws.row_dimensions[curr].height = 16
     for ci, m in enumerate(methods):
-        col = 1 + ci*2
+        col = 1 + ci * 2
         ws.cell(row=curr, column=col, value=f"☐ {m}").font = Font(size=9)
     curr += 2
-    
+
     ws.cell(row=curr, column=1, value="Comments:").font = s['bold']
     for _ in range(4):
+        ws.row_dimensions[curr].height = 16
         ws.cell(row=curr, column=2).border = Border(bottom=s['thin_side'])
-        ws.merge_cells(start_row=curr, start_column=2, end_row=curr, end_column=14)
+        ws.merge_cells(start_row=curr, start_column=2, end_row=curr, end_column=last_method_col)
         curr += 1
 
     curr += 2
     _v2_draw_questionnaire(ws, curr, q_list, rating_index, methods, ws1_scores, ws2_scores)
+
 
 
 def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_scores, ws2_scores):
