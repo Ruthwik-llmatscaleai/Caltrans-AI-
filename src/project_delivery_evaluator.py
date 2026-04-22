@@ -433,33 +433,31 @@ For questions using "No more than typical / More than typical / Much more than t
 
     few_shot = """EVALUATION METHODOLOGY:
 For each of the 25 questions, follow this chain-of-thought:
-1. EXTRACT: Find all evidence in the narrative relevant to this question. Quote or summarize directly.
+1. EXTRACT: Find ALL evidence in the narrative relevant to this question. Quote the EXACT sentence(s).
 2. ANALYZE: Apply the rubric criteria. Compare evidence against options A, B, and C.
 3. RATE: Select the rating that best matches.
-4. FLAG: If insufficient evidence, set missing_info to true and estimate using domain knowledge. Lower confidence to 0.2-0.4 for estimates.
+4. FLAG: If insufficient evidence, set missing_info to true and explain in missing_info_reasoning how that gap would shift the delivery method recommendation.
 
-When a question has no direct evidence, check if related questions provide indirect evidence. For example, if A3 (complexity) has evidence of high complexity, that indirectly supports higher ratings for C1 (innovation opportunity) and B1 (fast-tracking benefit).
+For source_reasoning: ALWAYS quote the exact text from the document with its section, then state your inference.
+For missing_info_reasoning: If data is missing, explain what is missing AND which delivery methods would be higher/lower priority if that data were available.
 
 EXAMPLE 1 - Question A2 (Project Size):
-source_reasoning: "The construction capital cost is estimated at $45 million."
-missing_info_reasoning: "Funding is confirmed for construction, but no specific utility relocation estimates are provided yet."
-effect_on_method: "$45M falls within the standard Design-Build range. The confirmed funding favors Design-Build over traditional DBB for better cost control."
+source_reasoning: "Section 4 (Financial Summary): 'The engineer\'s estimate for construction capital is $48.7 million.' — This places the project squarely in the B ($25–75M) band per Caltrans baseline norms. Conclusion: Rating B."
+missing_info_reasoning: "None — all evidence present. Construction cost is explicitly stated."
 selected_rating: "B"
 confidence: 0.95
 missing_info: false
 
 EXAMPLE 2 - Question A7 (Utility/Third-Party Issues):
-source_reasoning: "The project requires coordination with BNSF railroad for track closures and PG&E for gas line relocation. Multiple utility relocations are anticipated."
-missing_info_reasoning: "Specific right-of-way entry agreements with BNSF are not yet in place."
-effect_on_method: "Railroad and utility coordination involving multiple parties goes beyond typical. CMGC or PDB would be beneficial to bring in a contractor early to manage these risks."
-selected_rating: "B"
+source_reasoning: "Section 7 (Utilities): 'The project requires coordination with BNSF railroad for track closures and PG&E for gas line relocation. Multiple utility relocations are anticipated.' — Multiple third-party utility relocations exceeding typical scope. Conclusion: Rating C."
+missing_info_reasoning: "Section 7 references BNSF right-of-way entry agreements as pending. If these agreements cannot be secured, schedule risk increases significantly, further favouring CMGC or PDB over DBB to allow early contractor involvement in negotiations."
+selected_rating: "C"
 confidence: 0.85
 missing_info: false
 
 EXAMPLE 3 - Question C1 (Innovation) with missing info:
-source_reasoning: "No explicit discussion of innovation opportunities found in the narrative."
-missing_info_reasoning: "The narrative lacks a section on innovation potential or alternative technical concepts."
-effect_on_method: "The narrative does not address innovation. Based on the project's complexity (if A3 suggests moderate complexity) and highway scope, moderate innovation potential is plausible but unconfirmed."
+source_reasoning: "No direct discussion of innovation opportunities found in sections 1-12 of the narrative."
+missing_info_reasoning: "The narrative lacks any section on innovation potential or alternative technical concepts. If the project has performance-spec elements (common in bridge rehab), the rating could shift from B to C, making Design-Build or PDB more suitable over DBB which relies on prescriptive specs."
 selected_rating: "B"
 confidence: 0.35
 missing_info: true"""
@@ -489,19 +487,20 @@ You must output ONLY valid JSON in the following format. Replace all placeholder
     {
       "question_id": "A1",
       "question_text": "Where is the Project in the project development process?",
-      "source_reasoning": "<direct quote or summary from narrative, or 'No direct evidence found'>",
-      "missing_info_reasoning": "<explicit explanation of what information is missing or 'None'>",
-      "effect_on_method": "<analysis of how this rating affects the suitability of the delivery method and comparison to rubric norms>",
+      "source_reasoning": "<Section [X]: 'exact quote from narrative' — 1-sentence inference explaining how this quote leads to the selected rating. If no direct quote, state 'No direct evidence in sections 1-12.' and explain your inference chain.>",
+      "missing_info_reasoning": "<If missing_info is true: state exactly what is missing AND explain which delivery methods would be re-ranked if that data were available (e.g., 'If utility costs exceed $5M, shifts from DBB to CMGC/PDB'). If missing_info is false: 'None — all evidence present.'>",
       "selected_rating": "A or B or C",
-      "confidence": 0.0 to 1.0,
-      "missing_info": true or false
+      "confidence": 0.0,
+      "missing_info": false
     }
   ],
   "missing_questions": ["list of question_ids where missing_info is true"],
   "summary": "<2-3 sentence overall assessment of the project and evaluation quality>"
 }
 
-CRITICAL: The "ratings" array must contain EXACTLY 25 items, one for each question A1 through F3, in order."""
+CRITICAL: The "ratings" array must contain EXACTLY 25 items, one for each question A1 through F3, in order.
+CRITICAL: source_reasoning MUST contain a direct quote from the document wherever evidence exists — do NOT paraphrase.
+CRITICAL: Do NOT include an effect_on_method field — that analysis belongs inside missing_info_reasoning."""
 
     return "\n\n".join([
         persona, kb_section, design_sequencing, rubric_text,
@@ -1917,22 +1916,22 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
             pts = round(affinity * 5, 1)
             display_val = f"{sel_rating} ({pts})" if sel_rating else ""
             
-            # ID cell (Merge vertically, leave empty)
-            if start_r != end_r:
-                ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col)
-            ws.cell(row=start_r, column=col).border = Border(left=thin, top=thin, bottom=thin)
+            # Merge BOTH sub-columns (col + col+1) horizontally AND all rows vertically
+            # This gives one clean merged cell per method per question
+            col_end = col + 1
+            if start_r == end_r:
+                ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
+            else:
+                ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
             
-            # Box cell (Merge vertically, show rating + points)
-            if start_r != end_r:
-                ws.merge_cells(start_row=start_r, start_column=col+1, end_row=end_r, end_column=col+1)
-            c = ws.cell(row=start_r, column=col+1, value=display_val)
+            c = ws.cell(row=start_r, column=col, value=display_val)
             c.font = s['bold']
-            c.alignment = s['center']
-            # Apply borders to the edges of the merge
-            c.border = Border(right=thin, top=thin, left=thin, bottom=thin if (start_r == end_r) else None)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            # Bottom border on last row for open-XML compliance
             if start_r != end_r:
                 ws.cell(row=end_r, column=col).border = Border(left=thin, bottom=thin)
-                ws.cell(row=end_r, column=col+1).border = Border(right=thin, bottom=thin)
+                ws.cell(row=end_r, column=col_end).border = Border(right=thin, bottom=thin)
             
         curr += 1 # Spacer row
 
@@ -2004,22 +2003,17 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
                 pts = round(affinity * 5, 1)
                 display_val = f"{sel_rating} ({pts})" if sel_rating else ""
                 
-                # ID cell (Merge vertically, leave empty)
-                if start_r != end_r:
-                    ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col)
-                ws.cell(row=start_r, column=col).border = Border(left=thin, top=thin, bottom=thin)
+                # Merge BOTH sub-columns (col + col+1) horizontally AND all rows vertically
+                col_end = col + 1
+                ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
                 
-                # Box cell (Merge vertically, show rating + points)
-                if start_r != end_r:
-                    ws.merge_cells(start_row=start_r, start_column=col+1, end_row=end_r, end_column=col+1)
-                c = ws.cell(row=start_r, column=col+1, value=display_val)
+                c = ws.cell(row=start_r, column=col, value=display_val)
                 c.font = s['bold']
-                c.alignment = s['center']
-                # Apply borders to the edges of the merge
-                c.border = Border(right=thin, top=thin, left=thin, bottom=thin if (start_r == end_r) else None)
+                c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                c.border = Border(left=thin, right=thin, top=thin, bottom=thin)
                 if start_r != end_r:
                     ws.cell(row=end_r, column=col).border = Border(left=thin, bottom=thin)
-                    ws.cell(row=end_r, column=col+1).border = Border(right=thin, bottom=thin)
+                    ws.cell(row=end_r, column=col_end).border = Border(right=thin, bottom=thin)
             
             curr += 1 # Spacer row
 
@@ -2046,8 +2040,8 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
 
 def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_method=None, title=None, project_name=None):
     """
-    Overhauled individual method worksheet with 7-column layout:
-    ID, Criteria, Rating, Confidence, Source, Missing Info, effect.
+    Individual method worksheet: 7-column layout.
+    ID | Criteria | Rating | Points | Confid. | Source Reasoning & Citation | Missing Info & Impact
     """
     s = _get_styles()
     
@@ -2055,25 +2049,25 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
 
     # 1. Header & Setup
     ws.column_dimensions['A'].width = 6   # ID
-    ws.column_dimensions['B'].width = 50  # Criteria
+    ws.column_dimensions['B'].width = 55  # Criteria
     ws.column_dimensions['C'].width = 10  # Rating
     ws.column_dimensions['D'].width = 10  # Points
     ws.column_dimensions['E'].width = 10  # Confid.
-    ws.column_dimensions['F'].width = 35  # Source Reasoning
-    ws.column_dimensions['G'].width = 30  # Missing Info
-    ws.column_dimensions['H'].width = 35  # Effect on Method
+    ws.column_dimensions['F'].width = 45  # Source Reasoning & Citation
+    ws.column_dimensions['G'].width = 50  # Missing Info & Impact
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=7)
     title_cell = ws.cell(row=1, column=1, value=title if title else f"DETAILED EVALUATION: {single_method}")
     title_cell.font = Font(bold=True, size=14)
     title_cell.alignment = s['center']
 
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=8)
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=7)
     sub_cell = ws.cell(row=2, column=1, value=f"Project: {project_name}" if project_name else "")
     sub_cell.alignment = s['center']
 
-    # 2. Table Headers
-    headers = ["ID", "EVALUATION CRITERIA", "RATING", "POINTS", "CONFID.", "SOURCE REASONING", "MISSING INFO", "EFFECT ON METHOD"]
+    # 2. Table Headers (7 columns)
+    headers = ["ID", "EVALUATION CRITERIA", "RATING", "POINTS", "CONFID.",
+               "SOURCE REASONING & CITATION", "MISSING INFO & IMPACT"]
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=4, column=ci, value=h)
         c.font = s['bold']
@@ -2089,10 +2083,9 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         sel_rating = robj.get("selected_rating", "").upper()
         confidence = robj.get("confidence", 0.0)
         
-        # Extract new reasoning fields
+        # Extract reasoning fields — source with citation, missing info with delivery impact
         source_res = robj.get("source_reasoning", robj.get("extracted_evidence", "No evidence found"))
-        missing_res = robj.get("missing_info_reasoning", "None")
-        effect_res = robj.get("effect_on_method", robj.get("rubric_analysis", "Analysis N/A"))
+        missing_res = robj.get("missing_info_reasoning", "None — all evidence present")
         
         start_row = current_row
         
@@ -2118,8 +2111,8 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         
         end_row = current_row - 1
         
-        # Vertical Merging for ID and reasoning columns
-        for col in [1, 3, 4, 5, 6, 7, 8]:
+        # Vertical Merging for ID and reasoning columns (7-col layout: no col 8)
+        for col in [1, 3, 4, 5, 6, 7]:
             if start_row != end_row:
                 ws.merge_cells(start_row=start_row, start_column=col, end_row=end_row, end_column=col)
         
@@ -2151,17 +2144,11 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         c_src.border = s['bdr']
         c_src.font = Font(size=9)
         
-        # Missing Info (G)
+        # Missing Info & Impact (G)
         c_miss = ws.cell(row=start_row, column=7, value=missing_res)
         c_miss.alignment = s['top_left']
         c_miss.border = s['bdr']
         c_miss.font = Font(size=9)
-        
-        # Effect on Method (H)
-        c_eff = ws.cell(row=start_row, column=8, value=effect_res)
-        c_eff.alignment = s['top_left']
-        c_eff.border = s['bdr']
-        c_eff.font = Font(size=9)
         
         # Borders for Criteria column (B)
         for r in range(start_row, end_row + 1):
@@ -2173,9 +2160,6 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
             )
 
         current_row += 1 # Spacer
-    ws.column_dimensions["L"].width = 10
-    ws.column_dimensions["M"].width = 12
-
     ws.column_dimensions["B"].width = 100
 
 

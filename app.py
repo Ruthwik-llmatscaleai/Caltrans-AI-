@@ -1455,7 +1455,7 @@ if app_option != "Select the Usecase":
                         st.session_state.pde_kb_text = load_delivery_method_kb()
                 
                 # Role Selection
-                pde_role = st.radio("View Perspective", ["District Team (Internal)", "Human in the feedback loop"], horizontal=True, key="pde_role")
+                pde_role = st.radio("View Perspective", ["District Team (Internal)", "HIFL (Human-in-the-Feedback Loop)"], horizontal=True, key="pde_role")
                 pde_report_mode = "Template Summary + Method Sheets (V2)" if is_pde_v2_menu else "Current Report (V1)"
 
                 # Run evaluation button
@@ -1844,7 +1844,7 @@ if app_option != "Select the Usecase":
                                     st.warning(f"⚠ Top methods are within {bc['score_gap']:.4f} of each other — recommend detailed project-specific comparison.")
 
                         # === VALIDATION MODE (Req 3.3 / 3.7) — Only for Human role ===
-                        if pde_role == "Human (Validation)" and validation_data:
+                        if pde_role == "HIFL (Human-in-the-Feedback Loop)" and validation_data:
                             with st.expander("🔍 Validation Report — AI vs District Ratings", expanded=True):
                                 summary = validation_data.get("summary", {})
                                 rate = summary.get("agreement_rate", 0)
