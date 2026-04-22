@@ -1972,22 +1972,33 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
             display_val = f"{sel_rating} ({pts})" if sel_rating else ""
             
             # Merge BOTH sub-columns (col + col+1) horizontally AND all rows vertically
-            # This gives one clean merged cell per method per question
             col_end = col + 1
-            if start_r == end_r:
-                ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
-            else:
-                ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
-            
+            ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
+
             c = ws.cell(row=start_r, column=col, value=display_val)
             c.font = s['bold']
             c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            c.border = Border(left=thin, right=thin, top=thin, bottom=thin)
-            # Bottom border on last row for open-XML compliance
-            if start_r != end_r:
-                ws.cell(row=end_r, column=col).border = Border(left=thin, bottom=thin)
-                ws.cell(row=end_r, column=col_end).border = Border(right=thin, bottom=thin)
-            
+
+            # Apply a COMPLETE outer border on every row/column edge of the merged region.
+            # For a 2-col wide merge: col=left edge, col_end=right edge.
+            # For each row: top row gets top border, bottom row gets bottom border.
+            # Both columns get left/right edges on every row in the range.
+            for r in range(start_r, end_r + 1):
+                is_top = (r == start_r)
+                is_bottom = (r == end_r)
+                # Left column of the merged pair
+                ws.cell(row=r, column=col).border = Border(
+                    left=thin,
+                    top=thin if is_top else None,
+                    bottom=thin if is_bottom else None,
+                )
+                # Right column of the merged pair
+                ws.cell(row=r, column=col_end).border = Border(
+                    right=thin,
+                    top=thin if is_top else None,
+                    bottom=thin if is_bottom else None,
+                )
+
         curr += 1 # Spacer row
 
     # SCORE Row for WS1 — label in col 2 (col 1 is only 5px narrow)
@@ -2065,18 +2076,29 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
                 pts = round(affinity * 5, 1)
                 display_val = f"{sel_rating} ({pts})" if sel_rating else ""
                 
-                # Merge BOTH sub-columns (col + col+1) horizontally AND all rows vertically
+                # Merge BOTH sub-columns horizontally AND all rows vertically
                 col_end = col + 1
                 ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
-                
+
                 c = ws.cell(row=start_r, column=col, value=display_val)
                 c.font = s['bold']
                 c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                c.border = Border(left=thin, right=thin, top=thin, bottom=thin)
-                if start_r != end_r:
-                    ws.cell(row=end_r, column=col).border = Border(left=thin, bottom=thin)
-                    ws.cell(row=end_r, column=col_end).border = Border(right=thin, bottom=thin)
-            
+
+                # Complete outer border on every row/column edge of the merged region
+                for r in range(start_r, end_r + 1):
+                    is_top = (r == start_r)
+                    is_bottom = (r == end_r)
+                    ws.cell(row=r, column=col).border = Border(
+                        left=thin,
+                        top=thin if is_top else None,
+                        bottom=thin if is_bottom else None,
+                    )
+                    ws.cell(row=r, column=col_end).border = Border(
+                        right=thin,
+                        top=thin if is_top else None,
+                        bottom=thin if is_bottom else None,
+                    )
+
             curr += 1 # Spacer row
 
     # SCORE Row for WS2 — label in col 2
