@@ -2184,7 +2184,7 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
             display_text = f"☐ {opt_key}. {opt_text}"
             if single_method:
                 fit = METHOD_AFFINITY.get(sec, {}).get(single_method, {}).get(opt_key, 0.5)
-                display_text += f" [{fit * 10.0:.1f} pts]"
+                display_text += f" [{fit * 5.0:.1f} pts]"
             
             c_opt = ws.cell(row=current_row, column=2, value=display_text)
             c_opt.font = Font(size=9)
