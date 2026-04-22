@@ -1527,7 +1527,7 @@ if app_option != "Select the Usecase":
                         st.subheader("Template Questionnaire View")
                         with st.expander("How scores are interpreted", expanded=True):
                             st.markdown("""
-                            - **Alignment Points (0-10)**: Shows how well each question's answer aligns with that delivery method.
+                            - **Alignment Points (0-5)**: Shows how well each question's answer aligns with that delivery method. Calculated as Affinity (0.0–1.0) × 5. A score of 5.0 = perfect fit; 0.5 = poor fit.
                             - **Selected**: The chosen rubric rating (`A/B/C`) for each question based on document evidence.
                             - **Suitability Score (Excel Only)**: Detailed high-precision calculation of method fit across all sections.
                             - **Decision Explanation (Excel Only)**: Detailed rationale for method recommendation and ranking.
@@ -1623,7 +1623,7 @@ if app_option != "Select the Usecase":
                             sec = qid[0]
                             sel = rating_index.get(qid, {}).get("selected_rating", "B").upper()
                             for m in method_labels:
-                                pts = METHOD_AFFINITY.get(sec, {}).get(m, {}).get(sel, 0.5) * 10
+                                pts = METHOD_AFFINITY.get(sec, {}).get(m, {}).get(sel, 0.5) * 5
                                 if sec == "A": ws1_scores[m] += pts
                                 else: ws2_scores[m] += pts
 
