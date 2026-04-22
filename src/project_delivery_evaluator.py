@@ -327,11 +327,11 @@ def extract_multi_doc_context(files) -> str:
     return "\n\n".join(combined_text)
 
 
-def extract_text_from_docx(file) -> tuple:
-    """Extract narrative text and any pre-filled ratings from a nomination fact sheet DOCX.
+def extract_text_from_docx(file) -> str:
+    """Extract narrative text from a nomination fact sheet DOCX.
 
     Returns:
-        (narrative_text, existing_ratings) where existing_ratings is a dict like {"A1": "B", ...}
+        narrative_text (str): The extracted text from the document.
     """
     doc = Document(file)
 
@@ -352,23 +352,7 @@ def extract_text_from_docx(file) -> tuple:
         narrative_parts.append(text)
     narrative_text = "\n".join(narrative_parts)
 
-    # Extract pre-filled ratings from Tables 3-8 (evaluation question tables)
-    existing_ratings = {}
-    for table in doc.tables:
-        if len(table.columns) != 3:
-            continue
-        header_cells = [cell.text.strip().upper() for cell in table.rows[0].cells]
-        if "QUESTION NO." not in header_cells[0] and "QUESTION" not in header_cells[0]:
-            continue
-        # This is a rubric question table
-        for row in table.rows[1:]:
-            cells = [cell.text.strip() for cell in row.cells]
-            question_id = cells[0].strip()
-            rating_text = cells[2].strip().upper() if len(cells) > 2 else ""
-            if question_id and rating_text in ("A", "B", "C"):
-                existing_ratings[question_id] = rating_text
-
-    return narrative_text, existing_ratings
+    return narrative_text
 
 
 def load_delivery_method_kb() -> str:
@@ -2121,10 +2105,10 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
         c.border = s['bdr']
     curr += 2
 
-def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_method=None, title=None, project_name=None):
+def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_method=None, title=None, project_name=None, validation_data=None):
     """
-    Individual method worksheet: 7-column layout.
-    ID | Criteria | Rating | Points | Confid. | Source Reasoning & Citation | Missing Info & Impact
+    Individual method worksheet: 8-column layout.
+    ID | Criteria | AI Rating | District Override | Points | Confid. | Source Reasoning & Citation | Missing Info & Impact
     """
     s = _get_styles()
     
@@ -2133,23 +2117,24 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
     # 1. Header & Setup
     ws.column_dimensions['A'].width = 6   # ID
     ws.column_dimensions['B'].width = 55  # Criteria
-    ws.column_dimensions['C'].width = 10  # Rating
-    ws.column_dimensions['D'].width = 10  # Points
-    ws.column_dimensions['E'].width = 10  # Confid.
-    ws.column_dimensions['F'].width = 45  # Source Reasoning & Citation
-    ws.column_dimensions['G'].width = 50  # Missing Info & Impact
+    ws.column_dimensions['C'].width = 10  # AI Rating
+    ws.column_dimensions['D'].width = 15  # District Override
+    ws.column_dimensions['E'].width = 10  # Points
+    ws.column_dimensions['F'].width = 10  # Confid.
+    ws.column_dimensions['G'].width = 45  # Source Reasoning & Citation
+    ws.column_dimensions['H'].width = 50  # Missing Info & Impact
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=7)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
     title_cell = ws.cell(row=1, column=1, value=title if title else f"DETAILED EVALUATION: {single_method}")
     title_cell.font = Font(bold=True, size=14)
     title_cell.alignment = s['center']
 
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=7)
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=8)
     sub_cell = ws.cell(row=2, column=1, value=f"Project: {project_name}" if project_name else "")
     sub_cell.alignment = s['center']
 
-    # 2. Table Headers (7 columns)
-    headers = ["ID", "EVALUATION CRITERIA", "RATING", "POINTS", "CONFID.",
+    # 2. Table Headers (8 columns)
+    headers = ["ID", "EVALUATION CRITERIA", "AI RATING", "DISTRICT OVERRIDE", "POINTS", "CONFID.",
                "SOURCE REASONING", "MISSING INFO & IMPACT"]
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=4, column=ci, value=h)
@@ -2159,12 +2144,19 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         c.border = s['bdr']
     
     current_row = 5
+    
+    override_lookup = {}
+    if validation_data and "comparisons" in validation_data:
+        for comp in validation_data["comparisons"]:
+            override_lookup[comp.get("question_id")] = comp.get("district_rating", "")
+            
     for q in q_list:
         qid = q["id"]
         sec = qid[0]
         robj = rating_index.get(qid, {})
         sel_rating = robj.get("selected_rating", "").upper()
         confidence = robj.get("confidence", 0.0)
+        dist_override = override_lookup.get(qid, "")
         
         # Extract reasoning fields — source with citation, missing info with delivery impact
         source_res = robj.get("source_reasoning", robj.get("extracted_evidence", "No evidence found"))
@@ -2194,8 +2186,8 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         
         end_row = current_row - 1
         
-        # Vertical Merging for ID and reasoning columns (7-col layout: no col 8)
-        for col in [1, 3, 4, 5, 6, 7]:
+        # Vertical Merging for ID and reasoning columns (8-col layout)
+        for col in [1, 3, 4, 5, 6, 7, 8]:
             if start_row != end_row:
                 ws.merge_cells(start_row=start_row, start_column=col, end_row=end_row, end_column=col)
         
@@ -2210,25 +2202,39 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         c_rate.alignment = s['center']
         c_rate.border = s['bdr']
         
-        # Points Cell (D)
-        c_pts = ws.cell(row=start_row, column=4, value=pts)
+        # District Override Cell (D)
+        if dist_override:
+            override_color = "166534" if dist_override == "A" else ("854D0E" if dist_override == "B" else ("991B1B" if dist_override == "C" else "000000"))
+            c_over = ws.cell(row=start_row, column=4, value=dist_override)
+            c_over.font = Font(bold=True, color=override_color)
+        else:
+            c_over = ws.cell(row=start_row, column=4, value="")
+        c_over.alignment = s['center']
+        c_over.border = s['bdr']
+        if dist_override and dist_override != sel_rating:
+            # Highlight disagreement cell in red tint
+            from openpyxl.styles import PatternFill
+            c_over.fill = PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")
+        
+        # Points Cell (E)
+        c_pts = ws.cell(row=start_row, column=5, value=pts)
         c_pts.font = s['bold']
         c_pts.alignment = s['center']
         c_pts.border = s['bdr']
         
-        # Confidence Cell (E)
-        c_conf = ws.cell(row=start_row, column=5, value=f"{confidence:.2f}")
+        # Confidence Cell (F)
+        c_conf = ws.cell(row=start_row, column=6, value=f"{confidence:.2f}")
         c_conf.alignment = s['center']
         c_conf.border = s['bdr']
         
-        # Source Reasoning (F)
-        c_src = ws.cell(row=start_row, column=6, value=source_res)
+        # Source Reasoning (G)
+        c_src = ws.cell(row=start_row, column=7, value=source_res)
         c_src.alignment = s['top_left']
         c_src.border = s['bdr']
         c_src.font = Font(size=9)
         
-        # Missing Info & Impact (G)
-        c_miss = ws.cell(row=start_row, column=7, value=missing_res)
+        # Missing Info & Impact (H)
+        c_miss = ws.cell(row=start_row, column=8, value=missing_res)
         c_miss.alignment = s['top_left']
         c_miss.border = s['bdr']
         c_miss.font = Font(size=9)
@@ -2252,6 +2258,7 @@ def build_evaluation_excel_v2(
     project_name: str,
     template_path: str,
     multi_method_data: dict = None,
+    validation_data: dict = None,
 ) -> BytesIO:
     """
     Build V2 workbook:
@@ -2315,7 +2322,8 @@ def build_evaluation_excel_v2(
             m_ws, RUBRIC_QUESTIONS, rating_index,
             single_method=method,
             title=f"{method} Detailed Elaboration: {project_name}",
-            project_name=project_name
+            project_name=project_name,
+            validation_data=validation_data
         )
 
     buf = BytesIO()
