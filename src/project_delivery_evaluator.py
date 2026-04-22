@@ -2051,11 +2051,7 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
     """
     s = _get_styles()
     
-    # Use s directly to avoid NameErrors
-    # Theme Colors
-    header_fill = s['header_fill_v2']
-    grey_fill = s['grey_fill']
-    wrap = s['wrap']
+    # All styles accessed via s dict — no local aliases to prevent NameErrors
 
     # 1. Header & Setup
     ws.column_dimensions['A'].width = 6   # ID
@@ -2070,18 +2066,18 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
     title_cell = ws.cell(row=1, column=1, value=title if title else f"DETAILED EVALUATION: {single_method}")
     title_cell.font = Font(bold=True, size=14)
-    title_cell.alignment = center_align
+    title_cell.alignment = s['center']
 
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=8)
     sub_cell = ws.cell(row=2, column=1, value=f"Project: {project_name}" if project_name else "")
-    sub_cell.alignment = center_align
+    sub_cell.alignment = s['center']
 
     # 2. Table Headers
     headers = ["ID", "EVALUATION CRITERIA", "RATING", "POINTS", "CONFID.", "SOURCE REASONING", "MISSING INFO", "EFFECT ON METHOD"]
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=4, column=ci, value=h)
         c.font = s['bold']
-        c.fill = header_fill
+        c.fill = s['header_fill_v2']
         c.alignment = s['center']
         c.border = s['bdr']
     
