@@ -1754,7 +1754,8 @@ if app_option != "Select the Usecase":
 
                         st.markdown(q_table_html, unsafe_allow_html=True)
                         
-                        st.caption("UI overhaul complete: redundancy removed and spacing improved for non-congested results.")
+                        
+
 
                     else:
                         # --- Override Notes (if rules fired) ---
