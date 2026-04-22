@@ -1905,6 +1905,17 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
     ws.cell(row=curr, column=1, value="EVALUATION OF PROJECT SCOPE AND CHARACTERISTICS").font = s['bold']
     ws.cell(row=curr, column=1).alignment = s['center']
     ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    curr += 1
+
+    # Points legend — explain the scoring formula once, right under the WS1 heading
+    legend = ws.cell(row=curr, column=1,
+        value="Scoring: Each question is rated A / B / C. "
+              "Points = Delivery Method Affinity (0.0 – 1.0) × 5 (max 5.0 per question). "
+              "A higher affinity score means the rating is a stronger fit for that delivery method.")
+    legend.font = Font(italic=True, size=8, color="595959")
+    legend.alignment = Alignment(wrap_text=True, horizontal="left", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    ws.row_dimensions[curr].height = 14
     curr += 2
 
     # Section A
@@ -1931,17 +1942,22 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
         sel_rating = rating_index.get(qid, {}).get("selected_rating", "B").upper()
         
         start_r = curr
-        # Draw Question
-        ws.cell(row=curr, column=1, value=f"{qid}. {q['question']}").font = s['bold']
-        ws.cell(row=curr, column=1).alignment = s['wrap']
+        # Draw Question — merge cols 1+2 so the full 60px width is used and text wraps properly
+        q_cell = ws.cell(row=curr, column=1, value=f"{qid}. {q['question']}")
+        q_cell.font = s['bold']
+        q_cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
         curr += 1
-        
-        # Draw Options
+
+        # Draw Options — also merge cols 1+2 so col B is not left empty
         opts_rendered = 0
         for opt_key, opt_label in [("A", "option_a"), ("B", "option_b"), ("C", "option_c")]:
             opt_text = q.get(opt_label, "")
             if opt_text:
-                ws.cell(row=curr, column=1, value=f"☐ {opt_key}. {opt_text}").font = Font(size=8)
+                opt_cell = ws.cell(row=curr, column=1, value=f"☐ {opt_key}. {opt_text}")
+                opt_cell.font = Font(size=8)
+                opt_cell.alignment = Alignment(wrap_text=True, vertical="top")
+                ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
                 curr += 1
                 opts_rendered += 1
         
@@ -1974,9 +1990,8 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
             
         curr += 1 # Spacer row
 
-    # SCORE Row for WS1
-    ws.cell(row=curr, column=1, value="Project Characteristics Subtotal (Total Questions A1-A10)").font = Font(italic=True, size=9)
-    ws.cell(row=curr, column=2, value="SCORE").font = s['bold']
+    # SCORE Row for WS1 — label in col 2 (col 1 is only 5px narrow)
+    ws.cell(row=curr, column=2, value="Project Characteristics Subtotal (Total Questions A1-A10) — SCORE").font = Font(italic=True, size=9)
     for ci, m in enumerate(methods):
         col = 3 + ci*2
         c = ws.cell(row=curr, column=col+1, value=round(ws1_scores[m]))
@@ -2004,7 +2019,10 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
     ]
     
     for prefix, section_title in other_sections:
-        ws.cell(row=curr, column=1, value=f"{prefix} - {section_title}").font = s['bold']
+        # Section title — merge cols 1+2 so it's readable despite narrow col A
+        sec_hdr = ws.cell(row=curr, column=1, value=f"{prefix} - {section_title}")
+        sec_hdr.font = s['bold']
+        ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
         # Headers
         for ci, method in enumerate(methods):
             col = 3 + ci*2
@@ -2020,16 +2038,21 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
             sel_rating = rating_index.get(qid, {}).get("selected_rating", "B").upper()
             
             start_r = curr
-            # Question text
-            ws.cell(row=curr, column=1, value=f"{qid}. {q['question']}").font = s['bold']
-            ws.cell(row=curr, column=1).alignment = s['wrap']
+            # Question text — merge cols 1+2 so col B is not empty and text wraps
+            q_cell = ws.cell(row=curr, column=1, value=f"{qid}. {q['question']}")
+            q_cell.font = s['bold']
+            q_cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
             curr += 1
-            
-            # Options
+
+            # Options — also merge cols 1+2
             for opt_key, opt_label in [("A", "option_a"), ("B", "option_b"), ("C", "option_c")]:
                 opt_text = q.get(opt_label, "")
                 if opt_text:
-                    ws.cell(row=curr, column=1, value=f"☐ {opt_key}. {opt_text}").font = Font(size=8)
+                    opt_cell = ws.cell(row=curr, column=1, value=f"☐ {opt_key}. {opt_text}")
+                    opt_cell.font = Font(size=8)
+                    opt_cell.alignment = Alignment(wrap_text=True, vertical="top")
+                    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
                     curr += 1
             
             # Total rows for this question
@@ -2056,9 +2079,8 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
             
             curr += 1 # Spacer row
 
-    # SCORE Row for WS2
-    ws.cell(row=curr, column=1, value="Success Criteria Subtotal (Total questions B-F)").font = Font(italic=True, size=9)
-    ws.cell(row=curr, column=2, value="SCORE").font = s['bold']
+    # SCORE Row for WS2 — label in col 2
+    ws.cell(row=curr, column=2, value="Success Criteria Subtotal (Total questions B-F) — SCORE").font = Font(italic=True, size=9)
     for ci, m in enumerate(methods):
         col = 3 + ci*2
         c = ws.cell(row=curr, column=col+1, value=round(ws2_scores[m]))
@@ -2106,7 +2128,7 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
 
     # 2. Table Headers (7 columns)
     headers = ["ID", "EVALUATION CRITERIA", "RATING", "POINTS", "CONFID.",
-               "SOURCE REASONING & CITATION", "MISSING INFO & IMPACT"]
+               "SOURCE REASONING", "MISSING INFO & IMPACT"]
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=4, column=ci, value=h)
         c.font = s['bold']
