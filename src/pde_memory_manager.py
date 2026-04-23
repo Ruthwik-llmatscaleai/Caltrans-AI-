@@ -159,7 +159,8 @@ def adjudicate_rule(rule: dict) -> dict:
     prompt_system = """You are a public procurement policy analyst reviewing a proposed rule 
 correction submitted by a Caltrans project delivery evaluator.
 
-The human evaluator is OVERRIDING the AI's original rating. The 'Summary' field typically denotes the change (e.g., "B->C" means the AI chose B, but the Human corrects it to C).
+The human evaluator is OVERRIDING the AI's original rating. The 'Summary' field describes the rating change in plain language (e.g., "Rating changed from B to C" means the AI chose B, but the Human corrects it to C).
+
 Your job: assess whether the human's correction is a legitimate, evidence-based adjustment, or whether it appears to be illogical, policy-violating, or an attempt to manipulate the scoring.
 
 Caltrans context: Delivery method scoring follows the PDPM (Project Delivery Procedure Manual). 

@@ -2206,7 +2206,8 @@ if app_option != "Select the Usecase":
                                 "Your Rating Override",
                                 ["A", "B", "C"],
                                 index=["A", "B", "C"].index(_current_override or _ai_rating),
-                                format_func=lambda x: _option_labels[x],
+                                format_func=lambda x, _lbl=_option_labels: _lbl[x],
+
                                 key=f"pde_or_{_qid}",
                             )
                             _nreason = st.text_area(
