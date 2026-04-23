@@ -379,8 +379,14 @@ def _build_rubric_text() -> str:
     return "\n".join(lines)
 
 
-def _build_system_prompt(kb_text: str, existing_ratings: dict = None) -> str:
-    """Build the full system prompt for the delivery evaluation."""
+def _build_system_prompt(kb_text: str, existing_ratings: dict = None, pde_rules: list = None) -> str:
+    """Build the full system prompt for the delivery evaluation.
+
+    Args:
+        kb_text: Delivery method knowledge base text.
+        existing_ratings: Optional district pre-filled ratings.
+        pde_rules: Optional list of approved institutional memory rules from pde_memory_manager.
+    """
 
     persona = """You are a Senior Alternative Contracting Expert at Caltrans Headquarters, Office of Innovative Design and Delivery (OIDD). You have 20+ years of experience evaluating project delivery method nominations across California. Your role is to objectively evaluate a district's nomination fact sheet against the 25-question delivery selection rubric.
 
@@ -459,6 +465,15 @@ DISTRICT PRE-FILLED RATINGS:
 The district has pre-filled these ratings: {ratings_str}
 Evaluate independently based on the evidence. After your independent evaluation, if your rating differs from the district's, note the disagreement in your effect_on_method."""
 
+    # Inject approved institutional memory rules if provided
+    institutional_memory_text = ""
+    if pde_rules:
+        try:
+            from src.pde_memory_manager import build_institutional_memory_block
+            institutional_memory_text = build_institutional_memory_block(pde_rules)
+        except Exception:
+            pass  # Never crash evaluation due to memory module failure
+
     output_schema = """OUTPUT FORMAT:
 You must output ONLY valid JSON in the following format. Replace all placeholders with real values extracted from the narrative.
 
@@ -486,16 +501,21 @@ CRITICAL: The "ratings" array must contain EXACTLY 25 items, one for each questi
 CRITICAL: source_reasoning MUST contain a direct quote from the document wherever evidence exists — do NOT paraphrase.
 CRITICAL: Do NOT include an effect_on_method field — that analysis belongs inside missing_info_reasoning."""
 
-    return "\n\n".join([
+    parts = [
         persona, kb_section, design_sequencing, rubric_text,
-        baseline_norms, few_shot, exclusion, existing_ratings_text, output_schema
-    ])
+        baseline_norms, few_shot, exclusion, existing_ratings_text,
+    ]
+    if institutional_memory_text:
+        parts.append(institutional_memory_text)
+    parts.append(output_schema)
+    return "\n\n".join(parts)
 
 
 # ==============================================================================
 # CORE EVALUATION FUNCTION
 # ==============================================================================
-def run_delivery_evaluation(narrative_text: str, kb_text: str, existing_ratings: dict = None, model_name: str = "gpt-4o") -> dict:
+def run_delivery_evaluation(narrative_text: str, kb_text: str, existing_ratings: dict = None,
+                            model_name: str = "gpt-4o", pde_rules: list = None) -> dict:
     """Run the 25-question delivery method evaluation using an LLM.
 
     Args:
@@ -503,11 +523,12 @@ def run_delivery_evaluation(narrative_text: str, kb_text: str, existing_ratings:
         kb_text: Text from the DeliveryMethodComparison PDF
         existing_ratings: Optional dict of district pre-filled ratings {"A1": "B", ...}
         model_name: The LLM model/endpoint to use (defaults to gpt-4o)
+        pde_rules: Optional list of approved rules from pde_memory_manager for institutional memory injection.
 
     Returns:
         Dict with evaluation results or {"error": "..."} on failure
     """
-    system_prompt = _build_system_prompt(kb_text, existing_ratings)
+    system_prompt = _build_system_prompt(kb_text, existing_ratings, pde_rules=pde_rules)
 
     user_message = f"""Please evaluate the following Alternative Delivery Nomination Fact Sheet against all 25 rubric questions.
 
@@ -736,6 +757,67 @@ _METHOD_PROS_CONS = {
 }
 
 
+def generate_key_factors_reasoning(method: str, key_factors: list, ratings: list) -> str:
+    """Generate a plain-English 2-sentence explanation for why the top-ranked delivery
+    method scored highest, using only the source_quotes already extracted in the evaluation.
+
+    This deliberately avoids re-sending the full narrative PDF to keep token cost minimal.
+    Falls back to an empty string on any failure — the caller shows static key_factors instead.
+
+    Args:
+        method: The recommended delivery method name.
+        key_factors: List of static key factor strings (e.g. ["A: Strong fit (C)"]).
+        ratings: The full 25-rating list from run_delivery_evaluation (contains source_reasoning per question).
+
+    Returns:
+        A 2-sentence plain-English explanation or "" on failure.
+    """
+    # Collect only the source_reasoning quotes for sections that are "Strong fit" or "Poor fit"
+    relevant_sections = set()
+    for kf in key_factors:
+        if kf and ":" in kf:
+            relevant_sections.add(kf.split(":")[0].strip())
+
+    evidence_snippets = []
+    for r in ratings:
+        if not isinstance(r, dict):  # guard against strings or unexpected types
+            continue
+        qid = r.get("question_id", "")
+        sec = qid[0] if qid else ""
+        if sec in relevant_sections:
+            quote = r.get("source_reasoning", "")
+            if quote and quote.strip() and "No direct evidence" not in quote:
+                # Truncate long quotes to keep prompt compact
+                snippet = quote[:300] + "..." if len(quote) > 300 else quote
+                evidence_snippets.append(f"[{qid}] {snippet}")
+
+    if not evidence_snippets:
+        return ""
+
+    prompt_system = f"""You are a Caltrans delivery method advisor. Based on the evaluation evidence below, 
+write exactly 2 sentences explaining in plain English why '{method}' is the best fit for this project. 
+Be specific — reference the actual project characteristics mentioned in the evidence. Do not use vague phrases 
+like 'this method is ideal.' Focus on what makes this project's constraints align with {method}."""
+
+    prompt_user = "Evaluation evidence:\n" + "\n".join(evidence_snippets[:8])  # cap at 8 snippets
+
+    try:
+        client = _get_client("gpt-4o-mini")  # Use mini for this lightweight summarization
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": prompt_system},
+                {"role": "user", "content": prompt_user},
+            ],
+            temperature=0.2,
+            max_tokens=120,
+            timeout=15,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return ""  # Always fail gracefully — caller shows static key_factors
+
+
 def score_all_methods(ratings: list) -> dict:
     """Score ALL 6 delivery methods using the method-affinity matrix.
 
@@ -818,6 +900,15 @@ def score_all_methods(ratings: list) -> dict:
     # Borderline comparison for top 2-3
     borderline_comparison = None
     unblocked = [ms for ms in method_scores if not ms["blocked"]]
+    
+    if unblocked:
+        # Generate dynamic key factor logic for top method
+        unblocked[0]["key_factors_reasoning"] = generate_key_factors_reasoning(
+            unblocked[0]["method"],
+            unblocked[0]["key_factors"],
+            ratings  # pass original list-of-dicts, not rating_lookup.values()
+        )
+
     if len(unblocked) >= 2 and (unblocked[0]["score"] - unblocked[1]["score"]) <= 0.05:
         top_methods = unblocked[:3] if len(unblocked) >= 3 and (unblocked[0]["score"] - unblocked[2]["score"]) <= 0.10 else unblocked[:2]
         borderline_comparison = {
@@ -864,7 +955,7 @@ def run_validation_analysis(ai_ratings: list, user_ratings: dict) -> dict:
         user_rating = user_ratings.get(qid, "").upper()
 
         if not user_rating:
-            continue
+            user_rating = ai_rating
 
         ai_val = RATING_VALUES.get(ai_rating, 2)
         user_val = RATING_VALUES.get(user_rating, 2)
@@ -873,7 +964,10 @@ def run_validation_analysis(ai_ratings: list, user_ratings: dict) -> dict:
         if diff == 0:
             severity = "match"
         elif diff == 1:
-            severity = "minor_mismatch"
+            # Upgrade minor → major when AI confidence is high (≥75%)
+            # High confidence means the AI is near-certain; an override carries more weight
+            ai_confidence = r.get("confidence", 0)
+            severity = "major_mismatch" if ai_confidence >= 0.75 else "minor_mismatch"
         else:
             severity = "major_mismatch"
 
@@ -883,7 +977,7 @@ def run_validation_analysis(ai_ratings: list, user_ratings: dict) -> dict:
             "ai_rating": ai_rating,
             "user_rating": user_rating,
             "severity": severity,
-            "ai_evidence": r.get("extracted_evidence", ""),
+            "ai_evidence": r.get("source_reasoning", r.get("extracted_evidence", "No reasoning available")),
             "ai_confidence": round(r.get("confidence", 0), 2),
             "has_evidence": r.get("confidence", 0) >= 0.4,
         }
@@ -2118,23 +2212,22 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
     ws.column_dimensions['A'].width = 6   # ID
     ws.column_dimensions['B'].width = 55  # Criteria
     ws.column_dimensions['C'].width = 10  # AI Rating
-    ws.column_dimensions['D'].width = 15  # District Override
-    ws.column_dimensions['E'].width = 10  # Points
-    ws.column_dimensions['F'].width = 10  # Confid.
-    ws.column_dimensions['G'].width = 45  # Source Reasoning & Citation
-    ws.column_dimensions['H'].width = 50  # Missing Info & Impact
+    ws.column_dimensions['D'].width = 10  # Points
+    ws.column_dimensions['E'].width = 10  # Confid.
+    ws.column_dimensions['F'].width = 45  # Source Reasoning & Citation
+    ws.column_dimensions['G'].width = 50  # Missing Info & Impact
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=7)
     title_cell = ws.cell(row=1, column=1, value=title if title else f"DETAILED EVALUATION: {single_method}")
     title_cell.font = Font(bold=True, size=14)
     title_cell.alignment = s['center']
 
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=8)
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=7)
     sub_cell = ws.cell(row=2, column=1, value=f"Project: {project_name}" if project_name else "")
     sub_cell.alignment = s['center']
 
-    # 2. Table Headers (8 columns)
-    headers = ["ID", "EVALUATION CRITERIA", "AI RATING", "DISTRICT OVERRIDE", "POINTS", "CONFID.",
+    # 2. Table Headers (7 columns — District Override removed; overrides captured in pde_rules.json)
+    headers = ["ID", "EVALUATION CRITERIA", "AI RATING", "POINTS", "CONFID.",
                "SOURCE REASONING", "MISSING INFO & IMPACT"]
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=4, column=ci, value=h)
@@ -2145,10 +2238,6 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
     
     current_row = 5
     
-    override_lookup = {}
-    if validation_data and "comparisons" in validation_data:
-        for comp in validation_data["comparisons"]:
-            override_lookup[comp.get("question_id")] = comp.get("district_rating", "")
             
     for q in q_list:
         qid = q["id"]
@@ -2156,7 +2245,6 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         robj = rating_index.get(qid, {})
         sel_rating = robj.get("selected_rating", "").upper()
         confidence = robj.get("confidence", 0.0)
-        dist_override = override_lookup.get(qid, "")
         
         # Extract reasoning fields — source with citation, missing info with delivery impact
         source_res = robj.get("source_reasoning", robj.get("extracted_evidence", "No evidence found"))
@@ -2186,8 +2274,8 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         
         end_row = current_row - 1
         
-        # Vertical Merging for ID and reasoning columns (8-col layout)
-        for col in [1, 3, 4, 5, 6, 7, 8]:
+        # Vertical Merging for ID and related columns (7-col layout, no District Override)
+        for col in [1, 3, 4, 5, 6, 7]:
             if start_row != end_row:
                 ws.merge_cells(start_row=start_row, start_column=col, end_row=end_row, end_column=col)
         
@@ -2202,39 +2290,25 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
         c_rate.alignment = s['center']
         c_rate.border = s['bdr']
         
-        # District Override Cell (D)
-        if dist_override:
-            override_color = "166534" if dist_override == "A" else ("854D0E" if dist_override == "B" else ("991B1B" if dist_override == "C" else "000000"))
-            c_over = ws.cell(row=start_row, column=4, value=dist_override)
-            c_over.font = Font(bold=True, color=override_color)
-        else:
-            c_over = ws.cell(row=start_row, column=4, value="")
-        c_over.alignment = s['center']
-        c_over.border = s['bdr']
-        if dist_override and dist_override != sel_rating:
-            # Highlight disagreement cell in red tint
-            from openpyxl.styles import PatternFill
-            c_over.fill = PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")
-        
-        # Points Cell (E)
-        c_pts = ws.cell(row=start_row, column=5, value=pts)
+        # Points Cell (D) — was E
+        c_pts = ws.cell(row=start_row, column=4, value=pts)
         c_pts.font = s['bold']
         c_pts.alignment = s['center']
         c_pts.border = s['bdr']
         
-        # Confidence Cell (F)
-        c_conf = ws.cell(row=start_row, column=6, value=f"{confidence:.2f}")
+        # Confidence Cell (E) — was F
+        c_conf = ws.cell(row=start_row, column=5, value=f"{confidence:.2f}")
         c_conf.alignment = s['center']
         c_conf.border = s['bdr']
         
-        # Source Reasoning (G)
-        c_src = ws.cell(row=start_row, column=7, value=source_res)
+        # Source Reasoning (F) — was G
+        c_src = ws.cell(row=start_row, column=6, value=source_res)
         c_src.alignment = s['top_left']
         c_src.border = s['bdr']
         c_src.font = Font(size=9)
         
-        # Missing Info & Impact (H)
-        c_miss = ws.cell(row=start_row, column=8, value=missing_res)
+        # Missing Info & Impact (G) — was H
+        c_miss = ws.cell(row=start_row, column=7, value=missing_res)
         c_miss.alignment = s['top_left']
         c_miss.border = s['bdr']
         c_miss.font = Font(size=9)

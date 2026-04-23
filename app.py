@@ -1388,6 +1388,26 @@ if app_option != "Select the Usecase":
                 accept_multiple_files=True,
                 key="delivery_upload",
             )
+            # Rulebook upload (optional — for institutional memory)
+            rulebook_file = st.file_uploader(
+                "Upload prior Rulebook (pde_rules.json) — optional",
+                type=["json"],
+                key="delivery_rulebook_upload",
+                help="Upload a previously downloaded rulebook to apply institutional memory to this evaluation.",
+            )
+            if rulebook_file is not None:
+                from src.pde_memory_manager import load_rulebook
+                _loaded_rules, _load_warn = load_rulebook(rulebook_file)
+                if _load_warn and "Could not" in _load_warn:
+                    st.error(f"Rulebook load error: {_load_warn}")
+                elif _loaded_rules:
+                    st.session_state.pde_rules = _loaded_rules
+                    _approved_count = sum(1 for r in _loaded_rules if r.get("status") == "approved")
+                    st.success(f"{_approved_count} approved rule(s) loaded — these will guide this evaluation.")
+                    if _load_warn:
+                        st.warning(f"Some rules were skipped: {_load_warn}")
+            if "pde_rules" not in st.session_state:
+                st.session_state.pde_rules = []
 
         with col71:
             st.write("")
@@ -1464,6 +1484,7 @@ if app_option != "Select the Usecase":
                                 narrative_text,
                                 st.session_state.pde_kb_text,
                                 existing_ratings if existing_ratings else None,
+                                pde_rules=st.session_state.get("pde_rules", []),
                             )
                         if "error" in eval_result:
                             st.error(f"Evaluation Failed: {eval_result['error']}")
@@ -1472,6 +1493,7 @@ if app_option != "Select the Usecase":
                             st.session_state.pde_recommendation = compute_delivery_recommendation(
                                 eval_result.get("ratings", [])
                             )
+                            st.session_state.pde_step = 1  # Start wizard at Step 1
                             st.rerun()
 
                 # Display results
@@ -1488,6 +1510,42 @@ if app_option != "Select the Usecase":
                         st.session_state.pde_multi_method = score_all_methods(ratings)
                     multi_method_data = st.session_state.pde_multi_method
 
+                    # --- Build override-merged ratings for dynamic re-scoring ---
+                    _manual = st.session_state.get("pde_manual_ratings", {})
+                    _has_overrides = bool(_manual)
+                    if _has_overrides:
+                        _merged_ratings = []
+                        for _r in ratings:
+                            _qid = _r.get("question_id", "")
+                            if _qid in _manual:
+                                _copy = dict(_r)
+                                _copy["selected_rating"] = _manual[_qid]
+                                _merged_ratings.append(_copy)
+                            else:
+                                _merged_ratings.append(_r)
+                    else:
+                        _merged_ratings = ratings
+
+                    # Cache override-adjusted scoring — only recompute when manual ratings change
+                    # This avoids firing an LLM API call on every Streamlit re-render.
+                    _manual_key = str(sorted(_manual.items())) if _manual else ""
+                    if (
+                        "pde_override_multi" not in st.session_state
+                        or st.session_state.get("pde_override_multi_key") != _manual_key
+                    ):
+                        if _has_overrides:
+                            _override_rec = compute_delivery_recommendation(_merged_ratings)
+                            _override_multi = score_all_methods(_merged_ratings)
+                        else:
+                            _override_rec = recommendation
+                            _override_multi = multi_method_data
+                        st.session_state.pde_override_rec = _override_rec
+                        st.session_state.pde_override_multi = _override_multi
+                        st.session_state.pde_override_multi_key = _manual_key
+                    else:
+                        _override_rec = st.session_state.pde_override_rec
+                        _override_multi = st.session_state.pde_override_multi
+
                     # Compute validation analysis if user ratings exist (cached)
                     validation_data = None
                     if existing_ratings:
@@ -1496,9 +1554,48 @@ if app_option != "Select the Usecase":
                         validation_data = st.session_state.pde_validation
 
                     # --- Recommendation Card ---
-                    rec_method = recommendation.get("recommended_method", "N/A")
-                    comp_score = recommendation.get("composite_score", 0)
-                    runner_up = recommendation.get("runner_up_method", "N/A")
+                    # Show original (AI-only) and override-adjusted side by side if they differ
+                    _ai_method = recommendation.get("recommended_method", "N/A")
+                    _ai_score = recommendation.get("composite_score", 0)
+                    _ai_runner = recommendation.get("runner_up_method", "N/A")
+                    _ov_method = _override_rec.get("recommended_method", "N/A")
+                    _ov_score = _override_rec.get("composite_score", 0)
+                    _ov_runner = _override_rec.get("runner_up_method", "N/A")
+                    _has_overrides = bool(_manual)
+                    _method_changed = _ai_method != _ov_method
+
+                    # Active recommendation to display (override-adjusted if overrides exist)
+                    rec_method = _ov_method
+                    comp_score = _ov_score
+                    runner_up = _ov_runner
+
+                    # Build override badge HTML
+                    if _has_overrides and _method_changed:
+                        _override_badge = f"""
+                        <div style="margin-top:14px; padding:10px 14px; background:#fff7ed;
+                                    border-left:4px solid #ea580c; border-radius:6px;">
+                            <p style="margin:0; font-size:0.8rem; color:#9a3412; font-weight:600;">
+                                Override Impact — Recommendation Changed</p>
+                            <p style="margin:4px 0 0 0; font-size:0.9rem; color:#374151;">
+                                AI Original: <strong>{_ai_method}</strong> ({_ai_score:.2f})
+                                &nbsp;→&nbsp;
+                                Override-Adjusted: <strong>{_ov_method}</strong> ({_ov_score:.2f})
+                            </p>
+                        </div>"""
+                    elif _has_overrides:
+                        _override_badge = f"""
+                        <div style="margin-top:14px; padding:10px 14px; background:#f0fdf4;
+                                    border-left:4px solid #16a34a; border-radius:6px;">
+                            <p style="margin:0; font-size:0.8rem; color:#166534; font-weight:600;">
+                                Override Impact — Recommendation Confirmed</p>
+                            <p style="margin:4px 0 0 0; font-size:0.9rem; color:#374151;">
+                                Your {len(_manual)} override(s) were applied — the recommendation stays
+                                <strong>{_ov_method}</strong> (score adjusted from {_ai_score:.2f} to {_ov_score:.2f}).
+                            </p>
+                        </div>"""
+                    else:
+                        _override_badge = ""
+
                     st.markdown(f"""
                     <div style="
                         background: #ffffff;
@@ -1509,7 +1606,7 @@ if app_option != "Select the Usecase":
                         box-shadow: 0 2px 8px rgba(0,0,0,0.06);
                     ">
                         <p style="color: #64748b; margin: 0 0 8px 0; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 600;">
-                            Recommended Delivery Method</p>
+                            Recommended Delivery Method{'  (Override-Adjusted)' if _has_overrides else ''}</p>
                         <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px;">
                             <p style="color: #1F4E79; margin: 0; font-size: 2rem; font-weight: 700; line-height: 1.2;">
                                 {rec_method}</p>
@@ -1518,20 +1615,10 @@ if app_option != "Select the Usecase":
                         </div>
                         <p style="color: #64748b; margin: 12px 0 0 0; font-size: 0.95rem;">
                             Alternative: {runner_up}</p>
+                        {_override_badge}
                     </div>
                     """, unsafe_allow_html=True)
 
-                    df_rows = []
-                    for r in ratings:
-                        df_rows.append({
-                            "Q#": r.get("question_id", ""),
-                            "Question": r.get("question_text", ""),
-                            "Rating": r.get("selected_rating", ""),
-                            "Evidence": r.get("source_reasoning", ""),
-                            "Confidence": r.get("confidence", 0.0),
-                            "Missing": "Yes" if r.get("missing_info") else "No"
-                        })
-                    df = pd.DataFrame(df_rows)
 
                     if pde_report_mode == "Template Summary + Method Sheets (V2)":
                         st.subheader("Template Questionnaire View")
@@ -1543,7 +1630,8 @@ if app_option != "Select the Usecase":
                             - **Decision Explanation (Excel Only)**: Detailed rationale for method recommendation and ranking.
                             """)
 
-                        rating_index = {r.get("question_id"): r for r in ratings}
+                        # Use override-merged ratings so worksheet reflects user corrections
+                        rating_index = {r.get("question_id"): r for r in _merged_ratings}
                         method_labels = [
                             "Design-Bid-Build",
                             "Design-Sequencing",
@@ -1552,12 +1640,12 @@ if app_option != "Select the Usecase":
                             "CM/GC",
                             "Progressive Design-Build",
                         ]
-                        method_scores = {ms.get("method", ""): float(ms.get("score", 0) or 0) for ms in multi_method_data.get("method_scores", [])}
+                        method_scores = {ms.get("method", ""): float(ms.get("score", 0) or 0) for ms in _override_multi.get("method_scores", [])}
                         max_score = max(method_scores.values()) if method_scores else 1.0
 
                         # Build section-level dominant profile (same scoring convention used in backend)
                         section_ratings = {"A": [], "B": [], "C": [], "D": [], "E": [], "F": []}
-                        for rr in ratings:
+                        for rr in _merged_ratings:
                             qid = rr.get("question_id", "")
                             sel = rr.get("selected_rating", "B").upper()
                             if qid and qid[0] in section_ratings:
@@ -1806,24 +1894,73 @@ if app_option != "Select the Usecase":
                         with st.expander("View Detailed Comparison"):
                             st.markdown(recommendation.get("comparison_text", ""))
 
-                    # === MULTI-METHOD COMPARISON TABLE (Req 3.1) ===
-                    with st.expander("All Delivery Methods — Suitability Ranking", expanded=True):
-                        method_scores = multi_method_data.get("method_scores", [])
+                    # === MULTI-METHOD COMPARISON TABLE ===
+                    _table_label = "All Delivery Methods — Suitability Ranking" + (
+                        (f"  \u00b7  Override-Adjusted ({len(_manual)} change(s) applied)") if _has_overrides else ""
+                    )
+                    # Build a lookup from original scores for delta comparison
+                    _orig_scores = {ms["method"]: ms["score"] for ms in multi_method_data.get("method_scores", [])}
+                    with st.expander(_table_label, expanded=True):
+                        method_scores = _override_multi.get("method_scores", [])
                         if method_scores:
+                            # Helper to convert raw affinity strings to readable text
+                            _sec_names = {
+                                "A": "Project Scope", "B": "Schedule",
+                                "C": "Innovation", "D": "Quality",
+                                "E": "Cost", "F": "Staffing",
+                            }
+                            def _format_key_factors(kf_list):
+                                parts = []
+                                for kf in kf_list[:4]:
+                                    if ":" not in kf:
+                                        continue
+                                    sec = kf.split(":")[0].strip()
+                                    name = _sec_names.get(sec, sec)
+                                    if "Strong fit" in kf:
+                                        parts.append(f"{name} well-suited")
+                                    elif "Poor fit" in kf:
+                                        parts.append(f"{name} not well-suited")
+                                return "; ".join(parts) if parts else "Standard criteria apply"
+
                             mm_rows = []
                             for ms in method_scores:
-                                status = "🚫 Blocked" if ms.get("blocked") else "✅ Eligible"
+                                is_blocked = ms.get("blocked", False)
+                                status = "Ineligible" if is_blocked else "Eligible"
+
+                                # Key Factors logic:
+                                # Top eligible method -> LLM-generated reasoning
+                                # Ineligible methods  -> show the Caltrans rule that blocked it
+                                # All other eligible  -> human-readable affinity summary
+                                if is_blocked:
+                                    block_reasons = ms.get("block_reasons", [])
+                                    factors_str = "Blocked by: " + "; ".join(
+                                        r.split(": ", 1)[-1] for r in block_reasons
+                                    ) if block_reasons else "Does not meet mandatory eligibility criteria"
+                                elif ms.get("key_factors_reasoning"):
+                                    factors_str = ms["key_factors_reasoning"]
+                                else:
+                                    factors_str = _format_key_factors(ms.get("key_factors", []))
+
                                 mm_rows.append({
                                     "Rank": ms.get("rank", ""),
                                     "Method": ms.get("method", ""),
                                     "Score": f"{ms.get('score', 0):.4f}",
+                                    "Δ vs AI": (
+                                        f"+{ms['score'] - _orig_scores.get(ms['method'], ms['score']):.4f}"
+                                        if ms['score'] > _orig_scores.get(ms['method'], ms['score'])
+                                        else (
+                                            f"{ms['score'] - _orig_scores.get(ms['method'], ms['score']):.4f}"
+                                            if ms['score'] != _orig_scores.get(ms['method'], ms['score'])
+                                            else "—"
+                                        )
+                                    ) if _has_overrides else "",
                                     "Status": status,
-                                    "Key Factors": " | ".join(ms.get("key_factors", [])[:3]),
+                                    "Assessment": factors_str,
                                 })
                             mm_df = pd.DataFrame(mm_rows)
 
                             def _style_method_row(row):
-                                if "Blocked" in str(row.get("Status", "")):
+                                if row.get("Status") == "Ineligible":
                                     return ["color: #9ca3af; font-style: italic;"] * len(row)
                                 rank = row.get("Rank", 99)
                                 if rank == 1:
@@ -1832,12 +1969,16 @@ if app_option != "Select the Usecase":
                                     return ["background-color: #fef9c3; color: #854d0e;"] * len(row)
                                 return [""] * len(row)
 
+                            # Drop the empty delta column if no overrides
+                            if not _has_overrides:
+                                mm_df = mm_df.drop(columns=["Δ vs AI"], errors="ignore")
+
                             styled_mm = mm_df.style.apply(_style_method_row, axis=1)
                             st.dataframe(styled_mm, use_container_width=True, hide_index=True)
 
-                            # Pros/Cons for top 3
+                            # Pros/Cons for top 3 (from override-adjusted data)
                             st.markdown("**Top Methods — Pros & Cons:**")
-                            top3 = [ms for ms in method_scores if not ms.get("blocked")][:3]
+                            top3 = [ms for ms in _override_multi.get("method_scores", []) if not ms.get("blocked")][:3]
                             for ms in top3:
                                 pros = " • ".join(ms.get("pros", [])[:3])
                                 cons = " • ".join(ms.get("cons", [])[:3])
@@ -1853,129 +1994,43 @@ if app_option != "Select the Usecase":
                             if bc and bc.get("is_close"):
                                 st.warning(f"⚠ Top methods are within {bc['score_gap']:.4f} of each other — recommend detailed project-specific comparison.")
 
-                    # === VALIDATION MODE (Req 3.3 / 3.7) — Only for Human role ===
-                    if pde_role == "HIFL (Human-in-the-Feedback Loop)" and validation_data:
-                        with st.expander("🔍 Validation Report — AI vs District Ratings", expanded=True):
-                            summary = validation_data.get("summary", {})
-                            rate = summary.get("agreement_rate", 0)
-                            rate_color = "#166534" if rate >= 80 else ("#b45309" if rate >= 60 else "#991b1b")
-                            dev = validation_data.get("deviation_impact", {})
-
-                            st.markdown(f"""
-                            <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px;">
-                                <div style="flex: 1; min-width: 180px; background: #f0f9ff; border-radius: 10px; padding: 16px; text-align: center;">
-                                    <p style="margin: 0; color: #64748b; font-size: 0.8rem; text-transform: uppercase;">Agreement Rate</p>
-                                    <p style="margin: 4px 0 0 0; font-size: 1.8rem; font-weight: 700; color: {rate_color};">{rate}%</p>
-                                </div>
-                                <div style="flex: 1; min-width: 180px; background: #f0f9ff; border-radius: 10px; padding: 16px; text-align: center;">
-                                    <p style="margin: 0; color: #64748b; font-size: 0.8rem; text-transform: uppercase;">Matches</p>
-                                    <p style="margin: 4px 0 0 0; font-size: 1.8rem; font-weight: 700; color: #166534;">{summary.get('matches', 0)}</p>
-                                </div>
-                                <div style="flex: 1; min-width: 180px; background: #fffbeb; border-radius: 10px; padding: 16px; text-align: center;">
-                                    <p style="margin: 0; color: #64748b; font-size: 0.8rem; text-transform: uppercase;">Minor Mismatches</p>
-                                    <p style="margin: 4px 0 0 0; font-size: 1.8rem; font-weight: 700; color: #b45309;">{summary.get('minor_mismatches', 0)}</p>
-                                </div>
-                                <div style="flex: 1; min-width: 180px; background: #fef2f2; border-radius: 10px; padding: 16px; text-align: center;">
-                                    <p style="margin: 0; color: #64748b; font-size: 0.8rem; text-transform: uppercase;">Major Mismatches</p>
-                                    <p style="margin: 4px 0 0 0; font-size: 1.8rem; font-weight: 700; color: #991b1b;">{summary.get('major_mismatches', 0)}</p>
-                                </div>
-                            </div>
-                            """, unsafe_allow_html=True)
-
-                            # Deviation impact
-                            changed = dev.get("recommendation_changed", False)
-                            if changed:
-                                st.error(f"⚠ Recommendation would change: **{dev.get('ai_method', '')}** (AI) → **{dev.get('user_method', '')}** (User Ratings)")
-                            else:
-                                st.success(f"✅ Recommendation stays **{dev.get('ai_method', '')}** regardless of rating source")
-
-                            # Detail table
-                            comparisons = validation_data.get("comparisons", [])
-                            if comparisons:
-                                val_rows = []
-                                for comp in comparisons:
-                                    sev = comp.get("severity", "match")
-                                    sev_display = "✅" if sev == "match" else ("⚠" if sev == "minor_mismatch" else "🔴")
-                                    val_rows.append({
-                                        "Q#": comp.get("question_id", ""),
-                                        "AI": comp.get("ai_rating", ""),
-                                        "User": comp.get("user_rating", ""),
-                                        "Match": sev_display,
-                                        "Evidence": comp.get("ai_evidence", "")[:100],
-                                        "Confidence": comp.get("ai_confidence", 0),
-                                    })
-                                val_df = pd.DataFrame(val_rows)
-                                st.dataframe(val_df, use_container_width=True, hide_index=True)
-
-                    # --- Missing Info Notice ---
+                    # --- Missing Info Notice (compact — details shown in Step 1 wizard) ---
                     if missing:
-                        section_map = {
-                            "A": "Project Scope", "B": "Schedule",
-                            "C": "Innovation", "D": "Quality",
-                            "E": "Cost", "F": "Staffing",
-                        }
-                        section_counts = {}
-                        for qid in missing:
-                            sec = section_map.get(qid[0], qid[0])
-                            section_counts[sec] = section_counts.get(sec, 0) + 1
-                        grouped = ", ".join(f"{name} ({count})" for name, count in section_counts.items())
-
-                        st.markdown(f"""
-                        <div style="
-                            background: #fffbeb;
-                            border-left: 4px solid #f59e0b;
-                            border-radius: 0 8px 8px 0;
-                            padding: 16px 20px;
-                            margin: 0 0 16px 0;
-                        ">
-                            <p style="color: #92400e; margin: 0; font-weight: 600;">
-                                Some project details were not found in the document.</p>
-                            <p style="color: #78350f; margin: 6px 0 0 0; font-size: 0.9rem;">
-                                Providing more detail in these sections would improve accuracy: {grouped}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    # --- Evaluation Summary by Section ---
-                    with st.expander("Evaluation Summary by Section", expanded=pde_role == "District Team (Internal)"):
-                        section_names = {
-                            "A": "Project Scope & Characteristics",
-                            "B": "Schedule Issues",
-                            "C": "Opportunity for Innovation",
-                            "D": "Quality Enhancement",
-                            "E": "Cost Issues",
-                            "F": "Staffing Issues",
-                        }
-                        from src.project_delivery_evaluator import SECTION_WEIGHTS
-                        sec_data = []
-                        for sec, name in section_names.items():
-                            avg = recommendation.get("section_scores", {}).get(sec, 2.0)
-                            weight = SECTION_WEIGHTS[sec]
-                            sec_data.append({
-                                "Section": f"{sec}: {name}",
-                                "Avg Score": f"{avg:.2f}",
-                                "Weight": f"{weight:.0%}",
-                                "Weighted": f"{avg * weight:.3f}",
-                            })
-                        st.dataframe(pd.DataFrame(sec_data), use_container_width=True, hide_index=True)
+                        _sec_map = {"A": "Project Scope", "B": "Schedule", "C": "Innovation", "D": "Quality", "E": "Cost", "F": "Staffing"}
+                        _grouped = ", ".join(
+                            f"{_sec_map.get(q[0], q[0])} ({sum(1 for x in missing if x[0]==q[0])})"
+                            for q in dict.fromkeys(missing)
+                        )
+                        st.caption(
+                            f"📌 **Provisional results** — missing details in: {_grouped}. "
+                            "See Step 1 below to add corrections."
+                        )
 
                     # --- Evaluation Rules Reference ---
-                    with st.expander("Evaluation Rules Reference"):
+                    with st.expander("Caltrans Policy Rules Reference", expanded=False):
                         from src.project_delivery_evaluator import OVERRIDE_RULES
                         st.markdown("""
                         <p style="color: #475569; font-size: 0.9rem; margin-bottom: 12px;">
-                            The following rules are applied after scoring to ensure the recommendation
-                            aligns with Caltrans delivery method requirements and project constraints.</p>
+                            The following hardcoded framework rules are applied after scoring to ensure the recommendation
+                            aligns with Caltrans delivery method requirements.</p>
                         """, unsafe_allow_html=True)
+                        override_status = multi_method_data.get("override_status", [])
+                        triggered_ids = [o["rule_id"] for o in override_status if o["triggered"]]
                         for rule in OVERRIDE_RULES:
+                            is_trig = rule['id'] in triggered_ids
+                            bg_col = "#dcfce7" if is_trig else "#ffffff"
+                            bord_col = "#16a34a" if is_trig else "#e2e8f0"
+                            lbl = " <span style='color: #166534; font-weight: bold;'>[TRIGGERED FIRED]</span>" if is_trig else ""
                             st.markdown(f"""
                             <div style="
-                                border: 1px solid #e2e8f0;
+                                border: 2px solid {bord_col};
+                                background-color: {bg_col};
                                 border-radius: 8px;
                                 padding: 12px 16px;
                                 margin-bottom: 8px;
                             ">
                                 <p style="margin: 0 0 4px 0; font-weight: 600; color: #1F4E79; font-size: 0.9rem;">
-                                    {rule['id']}: {rule['name']}</p>
+                                    {rule['id']}: {rule['name']}{lbl}</p>
                                 <p style="margin: 0 0 4px 0; color: #64748b; font-size: 0.8rem;">
                                     Trigger: <code>{rule['trigger']}</code></p>
                                 <p style="margin: 0; color: #475569; font-size: 0.85rem;">
@@ -1983,123 +2038,533 @@ if app_option != "Select the Usecase":
                             </div>
                             """, unsafe_allow_html=True)
 
-                    # --- Ratings Dataframe ---
-                    # --- Ratings Dataframe (Editable) ---
-                    st.subheader("Interactive Question Ratings (HIFL)")
-                    st.markdown(
-                        "<p style='color:#475569; font-size: 0.95rem; margin-bottom:12px;'>"
-                        "Review the AI's ratings below. To provide your own feedback, select 'A', 'B', or 'C' in the <b>District Override</b> column. "
-                        "Switch your Perspective to <b>HIFL</b> at the top of the page to analyze the impact of your overrides.</p>",
-                        unsafe_allow_html=True
-                    )
+                    with st.expander("Institutional Memory (pde_rules.json)", expanded=False):
+                        if st.session_state.get("pde_rules"):
+                            st.json(st.session_state.pde_rules)
+                        else:
+                            st.caption("No overrides or learned context found in current rulebook.")
 
-                    # Create the override column
+                    # ============================================================
+                    # HIFL WIZARD — 4-step review flow
+                    # ============================================================
+                    from src.pde_memory_manager import (
+                        make_draft_rule,
+                        synthesize_rulebook, save_rulebook,
+                    )
+                    from src.project_delivery_evaluator import generate_key_factors_reasoning
+
+                    # Initialise wizard state
+                    if "pde_step" not in st.session_state:
+                        st.session_state.pde_step = 1
                     if "pde_manual_ratings" not in st.session_state:
                         st.session_state.pde_manual_ratings = {}
-                    
-                    df["District Override"] = df["Q#"].map(lambda qid: st.session_state.pde_manual_ratings.get(qid, ""))
-                    
-                    show_cols = [c for c in ["Q#", "Question", "Rating", "District Override", "Evidence", "Confidence", "Missing"] if c in df.columns]
-                    
-                    # Use data_editor to allow modifications
-                    edited_df = st.data_editor(
-                        df[show_cols],
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Q#": st.column_config.TextColumn(disabled=True),
-                            "Question": st.column_config.TextColumn(disabled=True, width="large"),
-                            "Rating": st.column_config.TextColumn(disabled=True),
-                            "Evidence": st.column_config.TextColumn(disabled=True, width="large"),
-                            "Confidence": st.column_config.NumberColumn(disabled=True),
-                            "Missing": st.column_config.TextColumn(disabled=True),
-                            "District Override": st.column_config.SelectboxColumn(
-                                "District Override",
-                                help="Select a manual rating to perform HIFL analysis.",
-                                options=["", "A", "B", "C"],
-                                required=False,
-                            )
+                    if "pde_draft_rules" not in st.session_state:
+                        st.session_state.pde_draft_rules = {}
+                    if "pde_final_rules" not in st.session_state:
+                        st.session_state.pde_final_rules = []
+                    if "pde_synthesis_note" not in st.session_state:
+                        st.session_state.pde_synthesis_note = ""
+
+                    wizard_step = st.session_state.pde_step
+
+                    # Step indicator bar — active step highlighted, completed steps marked ✓
+                    _step_labels = [
+                        "1 · Review & Override",
+                        "2 · Validation Audit",
+                        "3 · Export",
+                    ]
+                    _si_cols = st.columns(3)
+                    for _i, _lbl in enumerate(_step_labels):
+                        _step_num = _i + 1
+                        _active = (wizard_step == _step_num)
+                        _done = (wizard_step > _step_num)
+                        _disp_lbl = ("✓ " + _lbl) if _done else _lbl
+                        _border_col = "#1F4E79" if _active else ("#16a34a" if _done else "#e2e8f0")
+                        _color = "#1F4E79" if _active else ("#15803d" if _done else "#94a3b8")
+                        _fw = "700" if _active else "500"
+                        _si_cols[_i].markdown(
+                            f"<div style='text-align:center; padding:6px 0; "
+                            f"border-bottom: 3px solid {_border_col}; "
+                            f"color:{_color}; "
+                            f"font-weight:{_fw}; "
+                            f"font-size:0.85rem;'>{_disp_lbl}</div>",
+                            unsafe_allow_html=True,
+                        )
+                    st.write("")
+
+                    # ----------------------------------------------------------------
+                    # STEP 1 — Review ratings, stage corrections
+                    # ----------------------------------------------------------------
+                    if wizard_step == 1:
+                        st.subheader("Step 1 — Review AI Ratings & Provide Corrections")
+                        _rating_colors = {
+                            "A": ("#dcfce7", "#15803d"),
+                            "B": ("#fef9c3", "#854d0e"),
+                            "C": ("#fee2e2", "#b91c1c"),
                         }
-                    )
+                        ratings_list = eval_result.get("ratings", [])
+                        _missing_qids = [r.get("question_id", "") for r in ratings_list if r.get("missing_info")]
 
-                    # Capture cell changes to trigger revalidation
-                    has_changes = False
-                    for idx, row in edited_df.iterrows():
-                        qid = row["Q#"]
-                        override_val = row["District Override"]
+                        # Build per-question rubric lookup so the dropdown shows what A/B/C mean
+                        from src.project_delivery_evaluator import RUBRIC_QUESTIONS as _RQ
+                        _rubric_lookup = {q["id"]: q for q in _RQ}
+
+
+                        # --- Missing Info Banner ---
+                        if _missing_qids:
+                            st.warning(
+                                f"**{len(_missing_qids)} question(s) have missing project information "
+                                f"and need your input:** {', '.join(_missing_qids)}  \n"
+                                f"Select each from the dropdown below to provide the missing details."
+                            )
+
+                        # --- Filter toggle ---
+                        _filter_mode = st.radio(
+                            "Show questions:",
+                            ["All Questions", "Missing Info Only"],
+                            horizontal=True,
+                            key="pde_q_filter",
+                        )
+                        if _filter_mode == "Missing Info Only":
+                            _filtered_ratings = [r for r in ratings_list if r.get("missing_info")]
+                            if not _filtered_ratings:
+                                st.success("No missing information detected — all questions have sufficient evidence.")
+                                _filtered_ratings = ratings_list
+                        else:
+                            _filtered_ratings = ratings_list
+
+                        # Generate dropdown options from filtered list
+                        def _q_label(r):
+                            flag = " [Missing Info]" if r.get("missing_info") else ""
+                            return f"{r.get('question_id', '')} - {r.get('question_text', '')[:55]}...{flag}"
+
+                        _q_options = [_q_label(r) for r in _filtered_ratings]
+                        _sel_q_str = st.selectbox("Select Question to Review/Modify:", _q_options, key="pde_q_sel")
+
+                        # Find selected question data
+                        _sel_qid = _sel_q_str.split(" - ")[0].strip()
+                        _r = next((r for r in ratings_list if r.get("question_id", "") == _sel_qid), ratings_list[0])
                         
-                        if override_val in ["A", "B", "C"]:
-                            if st.session_state.pde_manual_ratings.get(qid) != override_val:
-                                st.session_state.pde_manual_ratings[qid] = override_val
-                                has_changes = True
-                        elif override_val == "" and qid in st.session_state.pde_manual_ratings:
-                            del st.session_state.pde_manual_ratings[qid]
-                            has_changes = True
+                        _qid = _r.get("question_id", "")
+                        _ai_rating = _r.get("selected_rating", "B").upper()
+                        _is_missing = _r.get("missing_info", False)
+                        _question_text = _r.get("question_text", "")
+                        _source_reasoning = _r.get("source_reasoning", "")
+                        _missing_reasoning = _r.get("missing_info_reasoning", "")
+                        _confidence = _r.get("confidence", 0)
 
-                    if has_changes:
-                        st.session_state.pde_existing_ratings = st.session_state.pde_manual_ratings
-                        if "pde_validation" in st.session_state:
-                            del st.session_state.pde_validation
-                        st.rerun()
+                        _existing_draft = st.session_state.pde_draft_rules.get(_qid)
+                        _current_override = _existing_draft["new_rating"] if _existing_draft else None
+                        _display_rating = _current_override if _current_override else _ai_rating
+                        _bg, _fg = _rating_colors.get(_display_rating, ("#f1f5f9", "#475569"))
 
-                    # --- Download & Reset ---
-                    # Cache Excel bytes in session state to survive reruns
-                    excel_cache_mode = st.session_state.get("pde_excel_mode")
-                    if "pde_excel_bytes" not in st.session_state or excel_cache_mode != pde_report_mode:
-                        if pde_report_mode == "Template Summary + Method Sheets (V2)":
-                            template_path = os.getenv(
-                                "PDE_V2_TEMPLATE_PATH",
-                                "templates/pde_v2_template.xls",
-                            )
-                            try:
-                                excel_buf = build_evaluation_excel_v2(
-                                    eval_result,
-                                    recommendation,
-                                    project_name,
-                                    template_path=template_path,
-                                    multi_method_data=multi_method_data,
-                                    validation_data=validation_data,
+                        with st.container(border=True):
+                            _hc1, _hc2 = st.columns([8, 2])
+                            with _hc1:
+                                _badge = "  ⚠️ *Missing context*" if _is_missing else ""
+                                st.markdown(f"**{_qid}** — {_question_text}{_badge}")
+                            with _hc2:
+                                _override_note = " *(overridden)*" if _current_override else ""
+                                st.markdown(
+                                    f"<div style='text-align:center; background:{_bg}; color:{_fg}; "
+                                    f"border-radius:6px; padding:4px 0; font-weight:700; font-size:1.1rem;'>"
+                                    f"Rating {_display_rating}{_override_note}</div>",
+                                    unsafe_allow_html=True,
                                 )
-                                st.session_state.pde_excel_filename = f"{project_name.replace(' ', '_')}_delivery_evaluation_v2.xlsx"
-                            except Exception as v2_err:
-                                st.error(f"Critical error during V2 Excel generation: {v2_err}")
-                                excel_buf = None
-                        else:
-                            # V1 Export (Legacy)
-                            try:
-                                excel_buf = build_evaluation_excel(
-                                    eval_result, recommendation, project_name,
-                                    multi_method_data=multi_method_data,
-                                    validation_data=validation_data,
+
+                            # Missing context input
+                            if _is_missing:
+                                _mkey = f"pde_missing_{_qid}"
+                                st.text_area(
+                                    f"Provide missing context for {_qid}:",
+                                    value=st.session_state.get(_mkey, ""),
+                                    placeholder=_missing_reasoning or "Describe what is missing...",
+                                    key=_mkey,
+                                    height=70,
                                 )
-                                st.session_state.pde_excel_filename = f"{project_name.replace(' ', '_')}_delivery_evaluation_v1.xlsx"
-                            except Exception as v1_err:
-                                st.error(f"Critical error during V1 Excel generation: {v1_err}")
-                                excel_buf = None
 
-                        if excel_buf:
-                            st.session_state.pde_excel_bytes = excel_buf.getvalue()
-                            st.session_state.pde_excel_mode = pde_report_mode
+                            # Evidence (collapsed by default — user can expand if needed)
+                            with st.expander(
+                                f"View AI Evidence (Confidence: {_confidence:.0%})",
+                                expanded=False,
+                            ):
+                                st.caption(_source_reasoning)
+                                if _missing_reasoning and "None" not in _missing_reasoning:
+                                    st.caption(f"**If resolved:** {_missing_reasoning}")
+
+                            _rubric_q = _rubric_lookup.get(_qid, {})
+                            _option_labels = {
+                                "A": f"A — {_rubric_q['option_a']}" if _rubric_q.get('option_a') else "A",
+                                "B": f"B — {_rubric_q['option_b']}" if _rubric_q.get('option_b') else "B",
+                                "C": f"C — {_rubric_q['option_c']}" if _rubric_q.get('option_c') else "C",
+                            }
+                            _nr = st.selectbox(
+                                "Your Rating Override",
+                                ["A", "B", "C"],
+                                index=["A", "B", "C"].index(_current_override or _ai_rating),
+                                format_func=lambda x: _option_labels[x],
+                                key=f"pde_or_{_qid}",
+                            )
+                            _nreason = st.text_area(
+                                "Why are you changing this? (required to save)",
+                                value=_existing_draft.get("user_rationale", "") if _existing_draft else "",
+                                placeholder="e.g. 'Section 4 confirms 70% design complete, not 30% as assumed.'",
+                                key=f"pde_reason_{_qid}",
+                                height=70,
+                            )
+                            
+                            if st.button("Save Override", key=f"pde_save_{_qid}", type="primary"):
+                                if len(_nreason.strip()) < 15:
+                                    st.warning("Please provide a more specific reason (at least 15 characters).")
+                                elif _nr == _ai_rating:
+                                    st.warning("Rating unchanged — select a different rating to save an override.")
+                                else:
+                                    _draft = make_draft_rule(
+                                        question_id=_qid,
+                                        summary=f"[{_qid}] {_ai_rating}→{_nr}",
+                                        source_evidence=_source_reasoning[:400] or "Not available",
+                                        user_rationale=_nreason.strip(),
+                                    )
+                                    _draft["new_rating"] = _nr
+                                    _draft["original_rating"] = _ai_rating
+                                    st.session_state.pde_draft_rules[_qid] = _draft
+                                    st.session_state.pde_manual_ratings[_qid] = _nr
+                                    st.session_state.pde_existing_ratings = st.session_state.pde_manual_ratings
+                                    for _stale in ["pde_validation", "pde_multi_method", "pde_override_multi", "pde_override_rec", "pde_override_multi_key"]:
+                                        if _stale in st.session_state:
+                                            del st.session_state[_stale]
+                                    st.rerun()
+
+                        st.write("---")
+                        st.subheader("Staged Corrections Queue")
+                        if not st.session_state.pde_draft_rules:
+                            st.caption("No overrides staged yet. You may proceed to Validation.")
                         else:
-                            st.session_state.pde_excel_bytes = None
-                            st.session_state.pde_excel_mode = None
+                            for _dqid, _drule in list(st.session_state.pde_draft_rules.items()):
+                                with st.container(border=True):
+                                    _qc1, _qc2 = st.columns([8, 2])
+                                    with _qc1:
+                                        st.markdown(f"**{_dqid}** changed from `{_drule['original_rating']}` to `{_drule['new_rating']}`")
+                                        st.caption(f"*Reason:* {_drule.get('user_rationale', '')}")
+                                    with _qc2:
+                                        if st.button("✕ Remove", key=f"pde_rm_{_dqid}"):
+                                            del st.session_state.pde_draft_rules[_dqid]
+                                            del st.session_state.pde_manual_ratings[_dqid]
+                                            st.session_state.pde_existing_ratings = st.session_state.pde_manual_ratings
+                                            for _stale in ["pde_validation", "pde_multi_method", "pde_override_multi", "pde_override_rec", "pde_override_multi_key"]:
+                                                if _stale in st.session_state:
+                                                    del st.session_state[_stale]
+                                            st.rerun()
 
-                    dl_col, reset_col, _ = st.columns([1, 1, 3])
-                    with dl_col:
-                        if st.session_state.get("pde_excel_bytes"):
-                            st.download_button(
-                                label="Download (.xlsx)",
-                                data=st.session_state.pde_excel_bytes,
-                                file_name=st.session_state.pde_excel_filename,
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key="pde_download",
+                        st.write("")
+                        if st.session_state.pde_draft_rules:
+                            st.info(
+                                f"{len(st.session_state.pde_draft_rules)} correction(s) staged. "
+                                "Proceed to Validation Audit to cross-check before export."
                             )
                         else:
-                            st.warning("Excel report is not available for download.")
-                    with reset_col:
-                        if st.button("Reset", key="pde_reset"):
-                            for key in [k for k in list(st.session_state.keys()) if k.startswith("pde_")]:
-                                del st.session_state[key]
+                            st.info("No corrections staged — you may proceed directly to export.")
+                        _n1, _n2, _n3 = st.columns([1, 1, 3])
+                        with _n1:
+                            if st.button("Next → Validation", key="pde_to2", type="primary"):
+                                st.session_state.pde_step = 2
+                                st.rerun()
+
+                    # ----------------------------------------------------------------
+                    # STEP 2 — Validation Audit (mandatory)
+                    # ----------------------------------------------------------------
+                    elif wizard_step == 2:
+                        st.subheader("Step 2 — Validation Audit")
+                        st.caption(
+                            "Review the AI's assessment of each correction you have staged. "
+                            "This step is mandatory before export to ensure each rating change is defensible "
+                            "and transparently logged into institutional memory."
+                        )
+
+                        if "pde_validation" not in st.session_state:
+                            if st.button("▶ Run Validation Audit", type="primary", key="pde_run_val"):
+                                with st.spinner("Running validation analysis..."):
+                                    from src.project_delivery_evaluator import run_validation_analysis
+                                    _val = run_validation_analysis(
+                                        eval_result.get("ratings", []),
+                                        st.session_state.pde_manual_ratings,
+                                    )
+                                st.session_state.pde_validation = _val
+                                st.rerun()
+                        else:
+                            _val = st.session_state.pde_validation
+                            _vs = _val.get("summary", {})
+                            _vi = _val.get("deviation_impact", {})
+
+                            # Summary metrics row
+                            _rate = _vs.get('agreement_rate', 0)
+                            _rate_color = "#166534" if _rate >= 80 else ("#b45309" if _rate >= 50 else "#991b1b")
+                            _vm1, _vm2, _vm3, _vm4 = st.columns(4)
+                            _vm1.metric("Agreement Rate", f"{_rate:.1f}%")
+                            _vm2.metric("Matches", _vs.get("matches", 0))
+                            _vm3.metric("Minor Disagreements", _vs.get("minor_mismatches", 0))
+                            _vm4.metric("Major Disagreements", _vs.get("major_mismatches", 0))
+
+                            if _vi.get("recommendation_changed"):
+                                st.warning(
+                                    f"Your overrides shift the final recommendation: "
+                                    f"**{_vi['ai_method']}** (AI) → **{_vi['user_method']}** (Your Ratings)"
+                                )
+                            else:
+                                st.success(f"Final recommendation stays **{_vi.get('ai_method', '')}** regardless of overrides.")
+
+                            if _rate < 10:
+                                st.error(
+                                    "Agreement Rate falls below 10%. "
+                                    "The AI heavily disagrees with these shifts. Provide overarching context below to prevent ambiguity in institutional memory."
+                                )
+                                st.text_area(
+                                    "Global Context (explain the paradigm shift):",
+                                    key="pde_global_context",
+                                    placeholder="e.g. 'This project uses a non-standard fast-track procurement, which changes the applicability of several standard criteria.'",
+                                    height=90
+                                )
+
+                            # Per-correction audit cards
+                            _mismatches = _val.get("mismatches", [])
+                            _all_comps = {c["question_id"]: c for c in _val.get("comparisons", [])}
+                            _staged = st.session_state.pde_draft_rules
+
+                            if _staged:
+                                st.markdown("---")
+                                st.markdown("**Detailed Correction Review**")
+                                st.caption("For each correction you staged, the AI's original reasoning and confidence are shown alongside your rationale.")
+
+                                for _dqid, _drule in _staged.items():
+                                    _comp = _all_comps.get(_dqid, {})
+                                    _sev = _comp.get("severity", "match")
+                                    _conf = _comp.get("ai_confidence", 0)
+                                    _ai_ev = _comp.get("ai_evidence", "No AI reasoning available.")
+                                    _ur = _drule.get("user_rationale", "No rationale recorded.")
+                                    _ai_r = _drule.get("original_rating", "?")
+                                    _u_r = _drule.get("new_rating", "?")
+
+                                    if _sev == "major_mismatch":
+                                        _conf_val = _conf
+                                        if _conf_val >= 0.75:
+                                            _sev_color = "#991b1b"
+                                            _sev_label = "High-Confidence Override"
+                                        else:
+                                            _sev_color = "#c2410c"
+                                            _sev_label = "Major Difference"
+                                        _sev_bg = "#fef2f2"
+                                        _show_reasoning = True
+                                    elif _sev == "minor_mismatch":
+                                        _sev_color = "#b45309"
+                                        _sev_label = "Minor Difference"
+                                        _sev_bg = "#fffbeb"
+                                        _show_reasoning = True
+                                    else:
+                                        _sev_color = "#166534"
+                                        _sev_label = "AI Agrees"
+                                        _sev_bg = "#f0fdf4"
+                                        _show_reasoning = False
+
+                                    # Neutral AI reasoning block — shows the AI's original evidence as-is.
+                                    # NOT a rebuttal; we do not try to argue against the user's rationale
+                                    # because the AI evidence can accidentally support the user's own argument.
+                                    if _show_reasoning:
+                                        _ai_ev_short = (_ai_ev[:350] + "…") if len(_ai_ev) > 350 else _ai_ev
+                                        _counter_html = (
+                                            f'<div style="background:#f8fafc;border-radius:6px;padding:10px;margin-bottom:8px;border-left:3px solid {_sev_color};">'
+                                            f'<p style="margin:0 0 5px 0;font-size:0.75rem;text-transform:uppercase;color:{_sev_color};font-weight:600;">AI\'s Original Reasoning (rated {_ai_r}):</p>'
+                                            f'<p style="margin:0;font-size:0.85rem;color:#374151;">{_ai_ev_short}</p>'
+                                            f'</div>'
+                                        )
+                                    else:
+                                        _counter_html = ""
+
+
+                                    st.markdown(f"""
+                                    <div style="border: 1px solid {_sev_color}40; border-left: 4px solid {_sev_color};
+                                                background: {_sev_bg}; border-radius: 8px;
+                                                padding: 14px 18px; margin-bottom: 12px;">
+                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                                            <span style="font-weight:700; color:#1F4E79; font-size:1rem;">{_dqid}</span>
+                                            <span style="font-size:0.8rem; color:{_sev_color}; font-weight:600;">{_sev_label}</span>
+                                        </div>
+                                        <div style="display:flex; gap:12px; margin-bottom:10px; font-size:0.85rem;">
+                                            <span>AI Rating: <strong>{_ai_r}</strong></span>
+                                            <span>→</span>
+                                            <span>Your Rating: <strong>{_u_r}</strong></span>
+                                            <span style="margin-left:auto; color:#64748b;">AI Confidence: {_conf:.0%}</span>
+                                        </div>
+                                        {_counter_html}
+                                        <div style="background:#eff6ff; border-radius:6px; padding:10px;">
+                                            <p style="margin:0 0 4px 0; font-size:0.75rem; text-transform:uppercase; color:#1e40af; font-weight:600;">Your Override Rationale</p>
+                                            <p style="margin:0; font-size:0.85rem; color:#1e3a8a;">{_ur}</p>
+                                        </div>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                            else:
+                                st.info("No corrections staged — all AI ratings accepted as-is.")
+
+                        _v1, _v2, _v3 = st.columns([1, 1, 3])
+                        with _v1:
+                            if st.button("← Back", key="pde_vback"):
+                                # Clear stale validation so Step 2 always shows fresh on return
+                                for _stale in ["pde_validation"]:
+                                    if _stale in st.session_state:
+                                        del st.session_state[_stale]
+                                st.session_state.pde_step = 1
+                                st.rerun()
+                        with _v2:
+                            if st.button("Finalize & Export →", type="primary", key="pde_v2to3"):
+                                # If global context was added, maybe package it as a master rule or simply ignore its logic implementation for prototype.
+                                # Since we dropping security, we auto-approve everything here too
+                                _approved_rules = list(st.session_state.pde_draft_rules.values())
+                                
+                                # Package global context if they wrote it
+                                if st.session_state.get("pde_global_context"):
+                                    _ctx_rule = make_draft_rule(
+                                        question_id="GLOBAL",
+                                        summary="Massive Override Context Justification",
+                                        source_evidence="Agreement dropped below 10%",
+                                        user_rationale=st.session_state.pde_global_context
+                                    )
+                                    _ctx_rule["status"] = "approved"
+                                    _approved_rules.append(_ctx_rule)
+
+                                for _r in _approved_rules:
+                                    _r["status"] = "approved"
+                                st.session_state.pde_final_rules = _approved_rules
+
+                                _existing_rb = st.session_state.get("pde_rules", [])
+                                if _approved_rules:
+                                    with st.spinner("Synthesizing rulebook..."):
+                                        _merged, _note = synthesize_rulebook(_existing_rb, _approved_rules)
+                                    st.session_state.pde_rules = _merged
+                                    st.session_state.pde_synthesis_note = _note
+                                    for _stale in ["pde_excel_bytes", "pde_excel_mode"]:
+                                        if _stale in st.session_state:
+                                            del st.session_state[_stale]
+                                st.session_state.pde_step = 3
+                                st.rerun()
+
+                    # ----------------------------------------------------------------
+                    # STEP 3 — Export (Excel + Rulebook)
+                    # ----------------------------------------------------------------
+                    elif wizard_step == 3:
+                        st.subheader("Step 3 — Export Report & Rulebook")
+
+                        _synth_note = st.session_state.get("pde_synthesis_note", "")
+                        if _synth_note:
+                            st.info(f"📚 {_synth_note}")
+
+                        _fc4 = len(st.session_state.pde_final_rules)
+                        if _fc4:
+                            st.success(
+                                f"**{_fc4} correction(s) committed to institutional memory.** "
+                                "These have been merged into the project rulebook."
+                            )
+                            with st.expander("View committed corrections", expanded=False):
+                                for _r in st.session_state.pde_final_rules:
+                                    st.markdown(
+                                        f"- **[{_r.get('question_id')}]** {_r.get('summary', '')}"
+                                    )
+
+                        # Excel generation (cached)
+                        excel_cache_mode = st.session_state.get("pde_excel_mode")
+                        if "pde_excel_bytes" not in st.session_state or excel_cache_mode != pde_report_mode:
+                            if pde_report_mode == "Template Summary + Method Sheets (V2)":
+                                template_path = os.getenv(
+                                    "PDE_V2_TEMPLATE_PATH",
+                                    "templates/pde_v2_template.xls",
+                                )
+                                try:
+                                    # Build a patched eval_result that carries override-adjusted ratings
+                                    _export_eval = dict(eval_result)
+                                    _export_eval["ratings"] = _merged_ratings
+                                    excel_buf = build_evaluation_excel_v2(
+                                        _export_eval,
+                                        _override_rec,
+                                        project_name,
+                                        template_path=template_path,
+                                        multi_method_data=_override_multi,
+                                        validation_data=validation_data,
+                                    )
+                                    st.session_state.pde_excel_filename = (
+                                        f"{project_name.replace(' ', '_')}_delivery_evaluation_v2.xlsx"
+                                    )
+                                except Exception as _v2err:
+                                    st.error(f"Critical error during V2 Excel generation: {_v2err}")
+                                    excel_buf = None
+                            else:
+                                try:
+                                    # Build a patched eval_result that carries override-adjusted ratings
+                                    _export_eval = dict(eval_result)
+                                    _export_eval["ratings"] = _merged_ratings
+                                    excel_buf = build_evaluation_excel(
+                                        _export_eval,
+                                        _override_rec,
+                                        project_name,
+                                        multi_method_data=_override_multi,
+                                        validation_data=validation_data,
+                                    )
+                                    st.session_state.pde_excel_filename = (
+                                        f"{project_name.replace(' ', '_')}_delivery_evaluation_v1.xlsx"
+                                    )
+                                except Exception as _v1err:
+                                    st.error(f"Critical error during V1 Excel generation: {_v1err}")
+                                    excel_buf = None
+
+                            if excel_buf:
+                                st.session_state.pde_excel_bytes = excel_buf.getvalue()
+                                st.session_state.pde_excel_mode = pde_report_mode
+                            else:
+                                st.session_state.pde_excel_bytes = None
+                                st.session_state.pde_excel_mode = None
+
+                        # Download buttons
+                        _dl1, _dl2, _dl3 = st.columns([1, 1, 2])
+                        with _dl1:
+                            if st.session_state.get("pde_excel_bytes"):
+                                st.download_button(
+                                    label="⬇ Download Report (.xlsx)",
+                                    data=st.session_state.pde_excel_bytes,
+                                    file_name=st.session_state.pde_excel_filename,
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key="pde_download_excel",
+                                )
+                            else:
+                                st.warning("Excel report not available.")
+                        with _dl2:
+                            _all_rules = st.session_state.get("pde_rules", [])
+                            _approved_rules = [r for r in _all_rules if r.get("status") == "approved"]
+                            if _approved_rules:
+                                _rb_json = save_rulebook(_all_rules)
+                                st.download_button(
+                                    label="⬇ Download Rulebook (.json)",
+                                    data=_rb_json,
+                                    file_name="pde_rules.json",
+                                    mime="application/json",
+                                    key="pde_download_rulebook",
+                                )
+                            else:
+                                st.caption("No approved rules to export yet.")
+
+                        # Reset
+                        st.write("")
+                        if st.session_state.pde_final_rules:
+                            st.caption(
+                                "⚠️ If you go back and stage additional corrections, "
+                                "click **Finalize & Export** again to update the rulebook and refresh the report."
+                            )
+                        if st.button("← Back to Review", key="pde_bk4"):
+                            # Clear Excel cache so re-entry regenerates a fresh report
+                            for _stale in ["pde_excel_bytes", "pde_excel_mode"]:
+                                if _stale in st.session_state:
+                                    del st.session_state[_stale]
+                            st.session_state.pde_step = 1
+                            st.rerun()
+                        if st.button("🔄 Reset (New Project)", key="pde_reset"):
+                            for _k in [k for k in list(st.session_state.keys()) if k.startswith("pde_")]:
+                                del st.session_state[_k]
                             st.rerun()
         with col73:
             st.write("")
