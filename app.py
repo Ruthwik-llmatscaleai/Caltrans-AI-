@@ -1945,7 +1945,7 @@ if app_option != "Select the Usecase":
                                     "Rank": ms.get("rank", ""),
                                     "Method": ms.get("method", ""),
                                     "Score": f"{ms.get('score', 0):.4f}",
-                                    "Δ vs AI": (
+                                    "Score Change": (
                                         f"+{ms['score'] - _orig_scores.get(ms['method'], ms['score']):.4f}"
                                         if ms['score'] > _orig_scores.get(ms['method'], ms['score'])
                                         else (
@@ -1971,7 +1971,7 @@ if app_option != "Select the Usecase":
 
                             # Drop the empty delta column if no overrides
                             if not _has_overrides:
-                                mm_df = mm_df.drop(columns=["Δ vs AI"], errors="ignore")
+                                mm_df = mm_df.drop(columns=["Score Change"], errors="ignore")
 
                             styled_mm = mm_df.style.apply(_style_method_row, axis=1)
                             st.dataframe(styled_mm, use_container_width=True, hide_index=True)
@@ -2020,7 +2020,7 @@ if app_option != "Select the Usecase":
                             is_trig = rule['id'] in triggered_ids
                             bg_col = "#dcfce7" if is_trig else "#ffffff"
                             bord_col = "#16a34a" if is_trig else "#e2e8f0"
-                            lbl = " <span style='color: #166534; font-weight: bold;'>[TRIGGERED FIRED]</span>" if is_trig else ""
+                            lbl = " <span style='color: #166534; font-weight: bold;'>● Applied to this project</span>" if is_trig else ""
                             st.markdown(f"""
                             <div style="
                                 border: 2px solid {bord_col};
@@ -2032,7 +2032,7 @@ if app_option != "Select the Usecase":
                                 <p style="margin: 0 0 4px 0; font-weight: 600; color: #1F4E79; font-size: 0.9rem;">
                                     {rule['id']}: {rule['name']}{lbl}</p>
                                 <p style="margin: 0 0 4px 0; color: #64748b; font-size: 0.8rem;">
-                                    Trigger: <code>{rule['trigger']}</code></p>
+                                    Applies when: <code>{rule['trigger']}</code></p>
                                 <p style="margin: 0; color: #475569; font-size: 0.85rem;">
                                     {rule['description']}</p>
                             </div>
@@ -2133,16 +2133,20 @@ if app_option != "Select the Usecase":
                         else:
                             _filtered_ratings = ratings_list
 
-                        # Generate dropdown options from filtered list
+                        # Generate dropdown options — show ID + truncated question text for navigation.
+                        # The full question text is displayed inside the card below, so we keep the
+                        # dropdown concise. Only append "..." when the text was actually truncated.
                         def _q_label(r):
                             flag = " [Missing Info]" if r.get("missing_info") else ""
-                            return f"{r.get('question_id', '')} - {r.get('question_text', '')[:55]}...{flag}"
+                            _qt = r.get('question_text', '')
+                            _short = (_qt[:52] + "...") if len(_qt) > 52 else _qt
+                            return f"{r.get('question_id', '')} — {_short}{flag}"
 
                         _q_options = [_q_label(r) for r in _filtered_ratings]
-                        _sel_q_str = st.selectbox("Select Question to Review/Modify:", _q_options, key="pde_q_sel")
+                        _sel_q_str = st.selectbox("Select Question:", _q_options, key="pde_q_sel")
 
-                        # Find selected question data
-                        _sel_qid = _sel_q_str.split(" - ")[0].strip()
+                        # Parse QID from the format "A1 — <text>" — split on the em-dash to be safe
+                        _sel_qid = _sel_q_str.split(" — ")[0].strip()
                         _r = next((r for r in ratings_list if r.get("question_id", "") == _sel_qid), ratings_list[0])
                         
                         _qid = _r.get("question_id", "")
@@ -2221,7 +2225,7 @@ if app_option != "Select the Usecase":
                                 else:
                                     _draft = make_draft_rule(
                                         question_id=_qid,
-                                        summary=f"[{_qid}] {_ai_rating}→{_nr}",
+                                        summary=f"Rating changed from {_ai_rating} to {_nr}",
                                         source_evidence=_source_reasoning[:400] or "Not available",
                                         user_rationale=_nreason.strip(),
                                     )
@@ -2236,7 +2240,7 @@ if app_option != "Select the Usecase":
                                     st.rerun()
 
                         st.write("---")
-                        st.subheader("Staged Corrections Queue")
+                        st.subheader("Pending Corrections")
                         if not st.session_state.pde_draft_rules:
                             st.caption("No overrides staged yet. You may proceed to Validation.")
                         else:
@@ -2282,7 +2286,7 @@ if app_option != "Select the Usecase":
                         )
 
                         if "pde_validation" not in st.session_state:
-                            if st.button("▶ Run Validation Audit", type="primary", key="pde_run_val"):
+                            if st.button("Run Audit", type="primary", key="pde_run_val"):
                                 with st.spinner("Running validation analysis..."):
                                     from src.project_delivery_evaluator import run_validation_analysis
                                     _val = run_validation_analysis(
@@ -2314,9 +2318,10 @@ if app_option != "Select the Usecase":
                                 st.success(f"Final recommendation stays **{_vi.get('ai_method', '')}** regardless of overrides.")
 
                             if _rate < 10:
-                                st.error(
-                                    "Agreement Rate falls below 10%. "
-                                    "The AI heavily disagrees with these shifts. Provide overarching context below to prevent ambiguity in institutional memory."
+                                st.warning(
+                                    "Agreement rate is below 10%. A high number of ratings differ from the AI's "
+                                    "initial assessment. Please provide a brief project-level context note below "
+                                    "to document the reason for these changes."
                                 )
                                 st.text_area(
                                     "Global Context (explain the paradigm shift):",
@@ -2423,7 +2428,7 @@ if app_option != "Select the Usecase":
                                 if st.session_state.get("pde_global_context"):
                                     _ctx_rule = make_draft_rule(
                                         question_id="GLOBAL",
-                                        summary="Massive Override Context Justification",
+                                        summary="Agreement rate below 10% — override context provided",
                                         source_evidence="Agreement dropped below 10%",
                                         user_rationale=st.session_state.pde_global_context
                                     )
@@ -2464,8 +2469,17 @@ if app_option != "Select the Usecase":
                             )
                             with st.expander("View committed corrections", expanded=False):
                                 for _r in st.session_state.pde_final_rules:
+                                    _orig = _r.get('original_rating', '')
+                                    _new = _r.get('new_rating', '')
+                                    _qid_label = _r.get('question_id', '')
+                                    _rationale_short = _r.get('user_rationale', '')[:100]
+                                    if _orig and _new:
+                                        _change_label = f"Rating changed from {_orig} to {_new}"
+                                    else:
+                                        _change_label = _r.get('summary', '')
                                     st.markdown(
-                                        f"- **[{_r.get('question_id')}]** {_r.get('summary', '')}"
+                                        f"- **{_qid_label}** — {_change_label}" +
+                                        (f" · *{_rationale_short}{'...' if len(_r.get('user_rationale','')) > 100 else ''}*" if _rationale_short else "")
                                     )
 
                         # Excel generation (cached)
@@ -2552,8 +2566,8 @@ if app_option != "Select the Usecase":
                         st.write("")
                         if st.session_state.pde_final_rules:
                             st.caption(
-                                "⚠️ If you go back and stage additional corrections, "
-                                "click **Finalize & Export** again to update the rulebook and refresh the report."
+                                "To add further corrections, use the Back button. "
+                                "Click Finalize & Export again to update the report."
                             )
                         if st.button("← Back to Review", key="pde_bk4"):
                             # Clear Excel cache so re-entry regenerates a fresh report
