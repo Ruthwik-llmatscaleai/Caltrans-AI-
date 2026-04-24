@@ -15,6 +15,7 @@ from src.chat_ui import text_based
 from src.cucp_reevals import cucp_reevaluations
 from src.foundation_model_chat import foundation_model_chat_ui
 from src.highway_incident_summarizer import summarize_caltrans_incidents
+from src.landing_ai_ui import render_landing_ai_evaluation_ui
 from src.project_delivery_evaluator import (
     extract_text_from_uploaded_pdf as pde_extract_pdf,
     extract_multi_doc_context,
@@ -154,6 +155,7 @@ if vAR_AI_application == "Caltrans":
                 "Personal Narrative Insights",
                 "Project Delivery Evaluator",
                 "Project Delivery Evaluator V2",
+                "Right of Way (ROW) Evaluation",
             ),
             key="app_select",
             label_visibility="collapsed"
@@ -1377,6 +1379,18 @@ if app_option != "Select the Usecase":
     elif app_option == "Highway Incident Summarizer":
         highway_incident_ui(app_option)
 
+    elif app_option == "Right of Way (ROW) Evaluation":
+        with col22:
+            st.subheader("Upload ROW Appraisal Report")
+        with col24:
+            st.file_uploader(
+                "Upload Right of Way Appraisal PDF",
+                type=["pdf"],
+                key="row_upload",
+                help="Upload a Caltrans Right of Way appraisal report for rubric-based evaluation.",
+            )
+        render_landing_ai_evaluation_ui()
+
     elif app_option in ["Project Delivery Evaluator", "Project Delivery Evaluator V2"]:
         is_pde_v2_menu = app_option == "Project Delivery Evaluator V2"
         with col22:
@@ -1558,9 +1572,11 @@ if app_option != "Select the Usecase":
                     _ai_method = recommendation.get("recommended_method", "N/A")
                     _ai_score = recommendation.get("composite_score", 0)
                     _ai_runner = recommendation.get("runner_up_method", "N/A")
+                    _ai_runner_aff = recommendation.get("runner_up_score")  # affinity 0-1, may be None
                     _ov_method = _override_rec.get("recommended_method", "N/A")
                     _ov_score = _override_rec.get("composite_score", 0)
                     _ov_runner = _override_rec.get("runner_up_method", "N/A")
+                    _ov_runner_aff = _override_rec.get("runner_up_score")  # affinity 0-1, may be None
                     _has_overrides = bool(_manual)
                     _method_changed = _ai_method != _ov_method
 
@@ -1568,6 +1584,7 @@ if app_option != "Select the Usecase":
                     rec_method = _ov_method
                     comp_score = _ov_score
                     runner_up = _ov_runner
+                    runner_up_aff = _ov_runner_aff
 
                     # Build override badge HTML
                     if _has_overrides and _method_changed:
@@ -1614,7 +1631,9 @@ if app_option != "Select the Usecase":
                                 Score: {comp_score:.2f} / 3.00</p>
                         </div>
                         <p style="color: #64748b; margin: 12px 0 0 0; font-size: 0.95rem;">
-                            Alternative: {runner_up}</p>
+                            Alternative: <strong>{runner_up}</strong>
+                            {f'&nbsp;<span style="background:#f0f9ff; color:#0369a1; border:1px solid #bae6fd; border-radius:4px; padding:1px 6px; font-size:0.82rem; font-weight:600;">Suitability: {runner_up_aff:.4f}</span>' if runner_up_aff is not None else ''}
+                        </p>
                         {_override_badge}
                     </div>
                     """, unsafe_allow_html=True)
@@ -1877,6 +1896,12 @@ if app_option != "Select the Usecase":
 
                     # --- Close Match Notice ---
                     if recommendation.get("is_borderline"):
+                        _rup_score_badge = (
+                            f" &nbsp;<span style='font-size:0.85rem; font-weight:500;'>"
+                            f"(suitability: {recommendation.get('recommended_score', 0):.4f} vs {runner_up_aff:.4f})</span>"
+                            if runner_up_aff is not None
+                            else ""
+                        )
                         st.markdown(f"""
                         <div style="
                             background: #fffbeb;
@@ -1886,7 +1911,7 @@ if app_option != "Select the Usecase":
                             margin: 0 0 16px 0;
                         ">
                             <p style="color: #92400e; margin: 0; font-weight: 600;">
-                                This is a close match between {rec_method} and {runner_up}.</p>
+                                This is a close match between {rec_method} and {runner_up}.{_rup_score_badge}</p>
                             <p style="color: #78350f; margin: 6px 0 0 0; font-size: 0.9rem;">
                                 Review the comparison below to confirm the best fit for this project.</p>
                         </div>

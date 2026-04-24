@@ -612,9 +612,46 @@ def compute_delivery_recommendation(ratings: list) -> dict:
         recommended, runner_up, rating_lookup
     )
 
-    # Recompute borderline comparison if override changed the recommendation
+    # Compute affinity scores for the recommended and runner-up methods so the
+    # UI can display both scores side-by-side.  We derive the section-dominant
+    # rating (A/B/C) from section_ratings (already built above) and look up
+    # each method's weighted affinity sum from METHOD_AFFINITY.
+    def _affinity_score_for_method(method_name: str) -> float:
+        """Return the weighted affinity score (0–1) for a single method."""
+        total = 0.0
+        for sec, weight in SECTION_WEIGHTS.items():
+            sec_vals = section_ratings.get(sec, [])
+            if not sec_vals:
+                dominant = "B"
+            else:
+                avg = sum(RATING_VALUES.get(rv, 2) for rv in sec_vals) / len(sec_vals)
+                dominant = "A" if avg >= 2.5 else ("C" if avg < 1.5 else "B")
+            affinity = METHOD_AFFINITY.get(sec, {}).get(method_name, {}).get(dominant, 0.5)
+            total += affinity * weight
+        return round(total, 4)
+
+    recommended_score = _affinity_score_for_method(recommended)
+    runner_up_score = _affinity_score_for_method(runner_up) if runner_up and runner_up != "N/A" else None
+
+    # Build (or rebuild after override) the borderline comparison text,
+    # now enriched with both methods' affinity scores.
+    method_affinity_scores = {
+        recommended: recommended_score,
+    }
+    if runner_up and runner_up != "N/A" and runner_up_score is not None:
+        method_affinity_scores[runner_up] = runner_up_score
+
+    comparison = _build_comparison(
+        recommended, runner_up, composite, section_scores, method_affinity_scores
+    )
+
+    # Recompute if an override already changed the pairing (comparison is
+    # rebuilt above regardless, so this branch is now a no-op guard kept for
+    # clarity — the scores-enriched comparison was just built).
     if override_reasons and is_borderline:
-        comparison = _build_comparison(recommended, runner_up, composite, section_scores)
+        comparison = _build_comparison(
+            recommended, runner_up, composite, section_scores, method_affinity_scores
+        )
 
     # --- Phase 2 Enhancements ---
     # Raw scores: numeric value per question
@@ -650,7 +687,9 @@ def compute_delivery_recommendation(ratings: list) -> dict:
         "override_status": override_status,
         "key_drivers": key_drivers,
         "recommended_method": recommended,
+        "recommended_score": recommended_score,
         "runner_up_method": runner_up,
+        "runner_up_score": runner_up_score,
         "is_borderline": is_borderline,
         "comparison_text": comparison,
         "override_reasons": override_reasons,
@@ -1301,15 +1340,60 @@ def _compute_override_status(rating_lookup: dict) -> list:
     return statuses
 
 
-def _build_comparison(recommended: str, runner_up: str, composite: float, section_scores: dict) -> str:
-    """Build a qualitative comparison for borderline cases."""
+def _build_comparison(
+    recommended: str,
+    runner_up: str,
+    composite: float,
+    section_scores: dict,
+    method_affinity_scores: dict = None,
+) -> str:
+    """Build a qualitative comparison for borderline cases.
+
+    Args:
+        recommended: Name of the recommended delivery method.
+        runner_up: Name of the runner-up delivery method.
+        composite: Weighted composite score (1–3 scale).
+        section_scores: Average score per section (A–F) on the 1–3 scale.
+        method_affinity_scores: Optional dict mapping method names to their
+            0–1 affinity suitability scores. When provided, both the
+            recommended and runner-up scores are displayed so the reader can
+            judge how close the alternatives are.
+    """
+    if method_affinity_scores is None:
+        method_affinity_scores = {}
+
+    rec_aff = method_affinity_scores.get(recommended)
+    rup_aff = method_affinity_scores.get(runner_up)
+
+    # Header — composite score (1–3 rubric) and the two competing methods
     lines = [
-        f"**Score: {composite:.2f} / 3.00**",
+        f"**Project Composite Score: {composite:.2f} / 3.00**",
         "",
-        f"The scores place this project near the boundary between **{recommended}** and **{runner_up}**.",
-        "",
-        "**Section Scores:**",
+        f"The overall score places this project near the boundary between "
+        f"**{recommended}** and **{runner_up}**.",
     ]
+
+    # Method suitability comparison (affinity scores, 0–1 scale)
+    if rec_aff is not None or rup_aff is not None:
+        lines.append("")
+        lines.append("**Method Suitability (0 – 1 scale, higher = better fit):**")
+        rec_bar = int(round(rec_aff * 10)) if rec_aff is not None else None
+        rup_bar = int(round(rup_aff * 10)) if rup_aff is not None else None
+        if rec_aff is not None:
+            filled = "█" * rec_bar + "░" * (10 - rec_bar)
+            lines.append(f"- **{recommended}**: {rec_aff:.4f}  `{filled}`")
+        if rup_aff is not None:
+            filled = "█" * rup_bar + "░" * (10 - rup_bar)
+            lines.append(f"- **{runner_up}**: {rup_aff:.4f}  `{filled}`")
+        if rec_aff is not None and rup_aff is not None:
+            gap = rec_aff - rup_aff
+            lines.append(f"- Score gap: **{gap:+.4f}** — {'very close' if abs(gap) < 0.02 else 'close'}")
+
+    # Section-level breakdown
+    lines.extend([
+        "",
+        "**Section Scores (rubric 1–3 scale, weight applied to composite):**",
+    ])
     section_names = {
         "A": "Project Scope & Characteristics",
         "B": "Schedule Issues",
@@ -1322,11 +1406,13 @@ def _build_comparison(recommended: str, runner_up: str, composite: float, sectio
         score = section_scores.get(s, 2.0)
         lines.append(f"- {name}: {score:.2f} / 3.00 (weight: {SECTION_WEIGHTS[s]:.0%})")
 
+    # Closing guidance
     lines.extend([
         "",
-        f"**{recommended}** is recommended as the primary method, but the project team should also evaluate "
-        f"**{runner_up}** given the proximity of scores. Consider the specific project constraints, district "
-        f"experience with each method, and stakeholder preferences when making the final decision.",
+        f"**{recommended}** is the primary recommendation, but **{runner_up}** scores "
+        f"competitively close. Consider district experience with each method, "
+        f"stakeholder preferences, and any project constraints not captured in the rubric "
+        f"before making the final decision.",
     ])
     return "\n".join(lines)
 
