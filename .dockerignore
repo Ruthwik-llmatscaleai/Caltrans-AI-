@@ -15,6 +15,7 @@ brain/
 tmp/
 *.json
 !memory_db.json
+!rubric_schema.json
 *.xls
 !templates/pde_v2_template.xls
 *.xlsx

@@ -30,7 +30,7 @@ from src.project_delivery_evaluator import (
     ALL_METHODS,
     RUBRIC_QUESTIONS,
 )
-from src.pde_agents import run_pde_evaluation
+from src.pde_pipeline import run_pde_evaluation
 
 
 def are_all_selected(options_list, selected_fields):

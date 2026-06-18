@@ -292,19 +292,55 @@ SECTION_WEIGHTS = {
 
 RATING_VALUES = {"A": 1, "B": 2, "C": 3}
 
+def get_selection_matrix_points(qid: str, method: str, sel_rating: str, rating_obj: dict = None):
+    """Return the Selection Matrix point value for a question/method/answer.
+
+    Returns None if the method is disqualified ("No-Go") for this answer.
+    Returns 0 if missing evidence (N/E) or missing_info=True.
+    """
+    if sel_rating in ("N/E", "NE", "N_E"):
+        return 0
+    if rating_obj and rating_obj.get("missing_info", False):
+        return 0
+    q_points = SCORING_POINTS.get(qid, {})
+    opt_points = q_points.get(sel_rating, {})
+    return opt_points.get(method, 0)
+
+
+
 
 # ==============================================================================
 # DOCUMENT EXTRACTION
 # ==============================================================================
 def extract_text_from_uploaded_pdf(file) -> str:
-    """Extract text from an uploaded PDF file object."""
+    """Extract text from an uploaded PDF file object.
+
+    Truncates at appendix headers (CM Tasks, Glossary, signature page) so the
+    narrative-only content is sent to the LLM, mirroring extract_text_from_docx.
+    """
     from PyPDF2 import PdfReader
     reader = PdfReader(file)
+    stop_keywords = [
+        "Construction Manager Tasks",
+        "Glossary of Preconstruction",
+        "District Single Point Signature",
+        "Project Risk Assessment",
+    ]
     text = ""
     for page in reader.pages:
         page_text = page.extract_text()
-        if page_text:
-            text += page_text + "\n"
+        if not page_text:
+            continue
+        kept_lines = []
+        truncated = False
+        for line in page_text.splitlines():
+            if any(kw.lower() in line.lower() for kw in stop_keywords):
+                truncated = True
+                break
+            kept_lines.append(line)
+        text += "\n".join(kept_lines) + "\n"
+        if truncated:
+            break
     return text
 
 
@@ -419,16 +455,24 @@ Design-Sequencing is NOT in the comparison PDF above. Key characteristics:
 For questions using "No more than typical / More than typical / Much more than typical", use these guidelines:
 - A (No more than typical): Standard Caltrans project, no unusual factors
 - B (More than typical): Notable complexity or needs beyond standard, but manageable
-- C (Much more than typical): Exceptional complexity, significant challenges requiring specialized approaches"""
+- C (Much more than typical): Exceptional complexity, significant challenges requiring specialized approaches
+
+"""
 
     few_shot = """EVALUATION METHODOLOGY:
 For each of the 25 questions, follow this chain-of-thought:
 1. EXTRACT: Find ALL evidence in the narrative relevant to this question. Quote the EXACT sentence(s).
 2. ANALYZE: Apply the rubric criteria. Compare evidence against options A, B, and C.
-3. RATE: Select the rating that best matches.
+3. RATE: Select the rating that best matches the evidence found.
 4. FLAG: If insufficient evidence, set missing_info to true and explain in missing_info_reasoning how that gap would shift the delivery method recommendation.
 
-For source_reasoning: ALWAYS quote the exact text from the document with its section, then state your inference.
+CRITICAL ANTI-FABRICATION RULE:
+- If the document does NOT contain evidence for a question, source_reasoning MUST state ONLY: "No direct evidence found in the document for this criterion."
+- Do NOT pull from unrelated sections to justify a rating. Do NOT infer from general project characteristics that do not directly address the specific criterion.
+- Example of WRONG behavior: Question asks about procurement cost impact on bidders, AI references "project was approved for CMGC" — this does NOT answer the question about procurement cost.
+- When evidence is absent, do NOT select a rating. Set selected_rating to "N/E" (No Evidence). This question will receive zero scoring weight and will be flagged for human review.
+
+For source_reasoning: ALWAYS quote the exact text from the document with its section, then state your inference. If no evidence exists, state "No direct evidence found in the document for this criterion." and STOP — do not elaborate with unrelated content.
 For missing_info_reasoning: If data is missing, explain what is missing AND which delivery methods would be higher/lower priority if that data were available.
 
 EXAMPLE 1 - Question A2 (Project Size):
@@ -445,16 +489,22 @@ selected_rating: "C"
 confidence: 0.85
 missing_info: false
 
-EXAMPLE 3 - Question C1 (Innovation) with missing info:
-source_reasoning: "No direct discussion of innovation opportunities found in sections 1-12 of the narrative."
-missing_info_reasoning: "The narrative lacks any section on innovation potential or alternative technical concepts. If the project has performance-spec elements (common in bridge rehab), the rating could shift from B to C, making Design-Build or PDB more suitable over DBB which relies on prescriptive specs."
-selected_rating: "B"
-confidence: 0.35
+EXAMPLE 3 - Question D3 (Warranties) with missing info:
+source_reasoning: "No direct evidence found in the document for this criterion."
+missing_info_reasoning: "The narrative does not discuss warranty or maintenance agreement plans. If warranties are planned, CM/GC and Design-Build methods would score higher as they facilitate negotiated warranty terms during preconstruction."
+selected_rating: "N/E"
+confidence: 0.90
 missing_info: true"""
 
     exclusion = """IMPORTANT EXCLUSIONS:
-- Do NOT evaluate any content from Sections 13, 14, or 15 of the fact sheet (Risk Register, CMGC Task Selection, Glossary).
-- Evaluate ONLY based on the project narrative from Sections 1-12 and any supplementary project details.
+- Do NOT evaluate any content from appendix sections of the fact sheet. These vary by template:
+    * Generic Alt Delivery template: Sections 13, 14, 15 (Risk Register, CMGC Task Selection, Glossary).
+    * CMGC Nomination Fact Sheet template: "Construction Manager Tasks", "Risk Identification and Mitigation",
+      "Schedule Risk Analysis/Control", "Glossary of Preconstruction Services Terms", "District Single Point Signature".
+- Evaluate ONLY based on the project narrative — typically numbered sections 1 through 8 (CMGC template) or
+  1 through 12 (generic Alt Delivery template) and any supplementary project details before the appendices.
+- Risk titles that appear in the narrative body (e.g., "RISK: Railroad Coordination" inside Section 9) ARE in scope;
+  the standalone CM Tasks appendix and Glossary are NOT.
 - Your evaluation must cover ALL 25 questions (A1 through F3). Do not skip any."""
 
     existing_ratings_text = ""
@@ -486,9 +536,9 @@ You must output ONLY valid JSON in the following format. Replace all placeholder
     {
       "question_id": "A1",
       "question_text": "Where is the Project in the project development process?",
-      "source_reasoning": "<Section [X]: 'exact quote from narrative' — 1-sentence inference explaining how this quote leads to the selected rating. If no direct quote, state 'No direct evidence in sections 1-12.' and explain your inference chain.>",
+      "source_reasoning": "<Section [X]: 'exact quote from narrative' — 1-sentence inference explaining how this quote leads to the selected rating. If no evidence exists, state ONLY: 'No direct evidence found in the document for this criterion.' — do NOT elaborate.>",
       "missing_info_reasoning": "<If missing_info is true: state exactly what is missing AND explain which delivery methods would be re-ranked if that data were available (e.g., 'If utility costs exceed $5M, shifts from DBB to CMGC/PDB'). If missing_info is false: 'None — all evidence present.'>",
-      "selected_rating": "A or B or C",
+      "selected_rating": "A or B or C or N/E (use N/E when missing_info is true)",
       "confidence": 0.0,
       "missing_info": false
     }
@@ -574,7 +624,10 @@ NOMINATION FACT SHEET CONTENT:
 # SCORING MATRIX & DELIVERY METHOD RECOMMENDATION
 # ==============================================================================
 def compute_delivery_recommendation(ratings: list) -> dict:
-    """Apply weighted scoring matrix to 25 A/B/C ratings and recommend a delivery method.
+    """Apply the official Caltrans Selection Matrix point system to recommend a delivery method.
+
+    Uses SCORING_POINTS: each question × answer × method → discrete points.
+    Method with highest total wins. None values = No-Go (disqualified).
 
     Args:
         ratings: List of 25 dicts with "question_id" and "selected_rating" keys
@@ -582,106 +635,107 @@ def compute_delivery_recommendation(ratings: list) -> dict:
     Returns:
         Dict with composite_score, section_scores, recommended_method, etc.
     """
-    # Group ratings by section
-    section_ratings = {"A": [], "B": [], "C": [], "D": [], "E": [], "F": []}
     rating_lookup = {}
+    rating_objs = {}
     for r in ratings:
         qid = r.get("question_id", "")
         rating = r.get("selected_rating", "B").upper()
-        if qid and qid[0] in section_ratings:
-            section_ratings[qid[0]].append(RATING_VALUES.get(rating, 2))
+        if qid:
             rating_lookup[qid] = rating
+            rating_objs[qid] = r
 
-    # Compute section averages
-    section_scores = {}
-    for section, values in section_ratings.items():
-        section_scores[section] = sum(values) / len(values) if values else 2.0
+    # Compute per-method total scores using Selection Matrix points
+    method_totals = {m: 0 for m in ALL_METHODS}
+    method_no_go = {m: False for m in ALL_METHODS}
+    method_section_scores = {m: {"A": 0, "B": 0, "C": 0, "D": 0, "E": 0, "F": 0} for m in ALL_METHODS}
 
-    # Compute weighted composite score
-    composite = sum(
-        section_scores[s] * SECTION_WEIGHTS[s] for s in SECTION_WEIGHTS
-    )
+    for qid in [q["id"] for q in RUBRIC_QUESTIONS]:
+        sel = rating_lookup.get(qid, "B")
+        robj = rating_objs.get(qid)
+        sec = qid[0] if qid else ""
+        for method in ALL_METHODS:
+            pts = get_selection_matrix_points(qid, method, sel, robj)
+            if pts is None:
+                method_no_go[method] = True
+            else:
+                method_totals[method] += pts
+                if sec in method_section_scores[method]:
+                    method_section_scores[method][sec] += pts
 
-    # Determine recommended method
-    recommended, runner_up, is_borderline, comparison = _determine_method(
-        composite, section_scores, rating_lookup
-    )
+    # Rank eligible methods by total score
+    eligible = [(m, method_totals[m]) for m in ALL_METHODS if not method_no_go[m]]
+    eligible.sort(key=lambda x: -x[1])
 
-    # Apply document-based override rules
+    if eligible:
+        recommended = eligible[0][0]
+        recommended_score = eligible[0][1]
+        runner_up = eligible[1][0] if len(eligible) > 1 else "N/A"
+        runner_up_score = eligible[1][1] if len(eligible) > 1 else None
+    else:
+        recommended = ALL_METHODS[0]
+        recommended_score = method_totals[recommended]
+        runner_up = "N/A"
+        runner_up_score = None
+
+    # Borderline: top 2 within 5 points
+    is_borderline = (runner_up_score is not None and (recommended_score - runner_up_score) <= 5)
+
+    # Apply override rules
     recommended, runner_up, override_reasons = _apply_overrides(
         recommended, runner_up, rating_lookup
     )
 
-    # Compute affinity scores for the recommended and runner-up methods so the
-    # UI can display both scores side-by-side.  We derive the section-dominant
-    # rating (A/B/C) from section_ratings (already built above) and look up
-    # each method's weighted affinity sum from METHOD_AFFINITY.
-    def _affinity_score_for_method(method_name: str) -> float:
-        """Return the weighted affinity score (0–1) for a single method."""
-        total = 0.0
-        for sec, weight in SECTION_WEIGHTS.items():
-            sec_vals = section_ratings.get(sec, [])
-            if not sec_vals:
-                dominant = "B"
-            else:
-                avg = sum(RATING_VALUES.get(rv, 2) for rv in sec_vals) / len(sec_vals)
-                dominant = "A" if avg >= 2.5 else ("C" if avg < 1.5 else "B")
-            affinity = METHOD_AFFINITY.get(sec, {}).get(method_name, {}).get(dominant, 0.5)
-            total += affinity * weight
-        return round(total, 4)
+    # Recompute scores after override swap
+    recommended_score = method_totals.get(recommended, 0)
+    runner_up_score = method_totals.get(runner_up, 0) if runner_up and runner_up != "N/A" else None
 
-    recommended_score = _affinity_score_for_method(recommended)
-    runner_up_score = _affinity_score_for_method(runner_up) if runner_up and runner_up != "N/A" else None
+    # Section scores (using the recommended method's breakdown)
+    section_scores = {}
+    for sec in ["A", "B", "C", "D", "E", "F"]:
+        section_scores[sec] = method_section_scores.get(recommended, {}).get(sec, 0)
 
-    # Build (or rebuild after override) the borderline comparison text,
-    # now enriched with both methods' affinity scores.
-    method_affinity_scores = {
-        recommended: recommended_score,
-    }
+    # Composite = total score of recommended method (for display purposes)
+    composite = recommended_score
+
+    # Build comparison text
+    method_point_scores = {recommended: recommended_score}
     if runner_up and runner_up != "N/A" and runner_up_score is not None:
-        method_affinity_scores[runner_up] = runner_up_score
+        method_point_scores[runner_up] = runner_up_score
 
     comparison = _build_comparison(
-        recommended, runner_up, composite, section_scores, method_affinity_scores
+        recommended, runner_up, composite, section_scores, method_point_scores
     )
 
-    # Recompute if an override already changed the pairing (comparison is
-    # rebuilt above regardless, so this branch is now a no-op guard kept for
-    # clarity — the scores-enriched comparison was just built).
-    if override_reasons and is_borderline:
-        comparison = _build_comparison(
-            recommended, runner_up, composite, section_scores, method_affinity_scores
-        )
-
-    # --- Phase 2 Enhancements ---
-    # Raw scores: numeric value per question
+    # Raw scores per question (numeric rating value for legacy compat)
     raw_scores = {qid: RATING_VALUES.get(r, 2) for qid, r in rating_lookup.items()}
 
-    # Weighted scores: section_avg × section_weight
-    weighted_scores = {s: round(section_scores[s] * SECTION_WEIGHTS[s], 4) for s in SECTION_WEIGHTS}
+    # Weighted scores = section point totals for recommended method
+    weighted_scores = {s: section_scores.get(s, 0) for s in ["A", "B", "C", "D", "E", "F"]}
 
-    # Override status: evaluate all 9 rules, mark triggered or not
+    # Override status
     override_status = _compute_override_status(rating_lookup)
 
-    # Key drivers: top 5 questions by weighted contribution
-    question_weights = []
-    for qid, raw in raw_scores.items():
-        sec = qid[0]
-        sec_count = len(section_ratings.get(sec, [1]))
-        per_q_weight = SECTION_WEIGHTS.get(sec, 0) / max(sec_count, 1)
-        question_weights.append({
+    # Key drivers: questions contributing most points to the recommended method
+    question_points = []
+    for qid in [q["id"] for q in RUBRIC_QUESTIONS]:
+        sel = rating_lookup.get(qid, "B")
+        robj = rating_objs.get(qid)
+        pts = get_selection_matrix_points(qid, recommended, sel, robj)
+        if pts is None:
+            pts = 0
+        question_points.append({
             "question_id": qid,
-            "raw_score": raw,
+            "raw_score": pts,
             "rating": rating_lookup.get(qid, "B"),
-            "section": sec,
-            "weighted_contribution": round(raw * per_q_weight, 4),
+            "section": qid[0] if qid else "",
+            "weighted_contribution": pts,
         })
-    question_weights.sort(key=lambda x: x["weighted_contribution"], reverse=True)
-    key_drivers = question_weights[:5]
+    question_points.sort(key=lambda x: -x["weighted_contribution"])
+    key_drivers = question_points[:5]
 
     return {
-        "composite_score": round(composite, 3),
-        "section_scores": {k: round(v, 3) for k, v in section_scores.items()},
+        "composite_score": composite,
+        "section_scores": section_scores,
         "raw_scores": raw_scores,
         "weighted_scores": weighted_scores,
         "override_status": override_status,
@@ -697,70 +751,141 @@ def compute_delivery_recommendation(ratings: list) -> dict:
 
 
 # ==============================================================================
-# MULTI-METHOD SCORING  (Req 3.1)
+# MULTI-METHOD SCORING — Official Caltrans Selection Matrix Point System
 # ==============================================================================
 
-# Method-affinity matrix derived from the Caltrans Delivery Method Comparison KB.
-# Each section maps to how strongly an "A" vs "C" rating favors each method.
-# Values: 1.0 = strongly favors, 0.5 = neutral, 0.0 = disfavors.
-# A rating of "C" (high complexity/need) is mapped using the "C" column;
-# "A" (simple/traditional) uses the "A" column; "B" interpolates.
-METHOD_AFFINITY = {
-    # Section A: Project Scope & Characteristics — high complexity favors CMGC/DB/PDB
-    "A": {
-        "Design-Bid-Build":        {"A": 1.0, "B": 0.6, "C": 0.1},
-        "Design-Sequencing":       {"A": 0.8, "B": 0.6, "C": 0.2},
-        "Design-Build/Low-Bid":    {"A": 0.3, "B": 0.5, "C": 0.7},
-        "Design-Build/Best-Value": {"A": 0.2, "B": 0.5, "C": 0.8},
-        "CM/GC":                   {"A": 0.3, "B": 0.6, "C": 0.9},
-        "Progressive Design-Build":{"A": 0.1, "B": 0.4, "C": 0.9},
+# Point scoring table extracted from the official Caltrans Project Delivery
+# Selection Tool (Selection Matrix). Each question × answer × method maps to
+# discrete point values. None = "No-Go" (method is disqualified).
+# Progressive Design-Build uses the same values as CM/GC except where noted.
+SCORING_POINTS = {
+    "A1": {
+        "A": {"Design-Bid-Build": 10, "Design-Sequencing": 0, "Design-Build/Low-Bid": None, "Design-Build/Best-Value": None, "CM/GC": None, "Progressive Design-Build": None},
+        "B": {"Design-Bid-Build": 10, "Design-Sequencing": 10, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 10, "Design-Sequencing": 10, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
     },
-    # Section B: Schedule Issues — urgency favors DB, CMGC, PDB
-    "B": {
-        "Design-Bid-Build":        {"A": 0.9, "B": 0.5, "C": 0.1},
-        "Design-Sequencing":       {"A": 0.7, "B": 0.5, "C": 0.3},
-        "Design-Build/Low-Bid":    {"A": 0.3, "B": 0.6, "C": 0.8},
-        "Design-Build/Best-Value": {"A": 0.3, "B": 0.6, "C": 0.8},
-        "CM/GC":                   {"A": 0.4, "B": 0.6, "C": 0.8},
-        "Progressive Design-Build":{"A": 0.3, "B": 0.5, "C": 0.8},
+    "A2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 3, "Design-Sequencing": 3, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 3, "Design-Sequencing": 0, "Design-Build/Low-Bid": 3, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
     },
-    # Section C: Innovation — high innovation favors DB/BV, CMGC, PDB
-    "C": {
-        "Design-Bid-Build":        {"A": 0.9, "B": 0.5, "C": 0.1},
-        "Design-Sequencing":       {"A": 0.7, "B": 0.5, "C": 0.2},
-        "Design-Build/Low-Bid":    {"A": 0.4, "B": 0.5, "C": 0.6},
-        "Design-Build/Best-Value": {"A": 0.2, "B": 0.5, "C": 0.9},
-        "CM/GC":                   {"A": 0.3, "B": 0.6, "C": 0.8},
-        "Progressive Design-Build":{"A": 0.2, "B": 0.5, "C": 0.9},
+    "A3": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 3, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 2, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 3, "CM/GC": 3, "Progressive Design-Build": 3},
+        "C": {"Design-Bid-Build": 2, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
     },
-    # Section D: Quality Enhancement — high quality needs favor DB/BV, CMGC
-    "D": {
-        "Design-Bid-Build":        {"A": 0.8, "B": 0.5, "C": 0.2},
-        "Design-Sequencing":       {"A": 0.7, "B": 0.5, "C": 0.3},
-        "Design-Build/Low-Bid":    {"A": 0.5, "B": 0.5, "C": 0.5},
-        "Design-Build/Best-Value": {"A": 0.3, "B": 0.5, "C": 0.8},
-        "CM/GC":                   {"A": 0.3, "B": 0.6, "C": 0.8},
-        "Progressive Design-Build":{"A": 0.3, "B": 0.5, "C": 0.8},
+    "A4": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 7, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
     },
-    # Section E: Cost Issues — constrained funding favors DBB; full funding favors DB
-    "E": {
-        "Design-Bid-Build":        {"A": 0.8, "B": 0.6, "C": 0.3},
-        "Design-Sequencing":       {"A": 0.7, "B": 0.5, "C": 0.3},
-        "Design-Build/Low-Bid":    {"A": 0.3, "B": 0.5, "C": 0.7},
-        "Design-Build/Best-Value": {"A": 0.2, "B": 0.5, "C": 0.7},
-        "CM/GC":                   {"A": 0.4, "B": 0.6, "C": 0.7},
-        "Progressive Design-Build":{"A": 0.2, "B": 0.5, "C": 0.8},
+    "A5": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 7, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
     },
-    # Section F: Staffing — lack of expertise favors DB, PDB, CMGC
-    "F": {
-        "Design-Bid-Build":        {"A": 0.8, "B": 0.5, "C": 0.1},
-        "Design-Sequencing":       {"A": 0.7, "B": 0.5, "C": 0.2},
-        "Design-Build/Low-Bid":    {"A": 0.4, "B": 0.5, "C": 0.6},
-        "Design-Build/Best-Value": {"A": 0.3, "B": 0.5, "C": 0.7},
-        "CM/GC":                   {"A": 0.5, "B": 0.6, "C": 0.7},
-        "Progressive Design-Build":{"A": 0.3, "B": 0.5, "C": 0.8},
+    "A6": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 7, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
+    },
+    "A7": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 5, "Progressive Design-Build": 5},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
+    },
+    "A8": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
+    },
+    "A9": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 5, "Progressive Design-Build": 5},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 10, "Progressive Design-Build": 10},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
+    },
+    "A10": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
+    },
+    "B1": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 3, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 6, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "B2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 3, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 6, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "C1": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "C2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 5, "Progressive Design-Build": 5},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 2, "Progressive Design-Build": 2},
+    },
+    "D1": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "D2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 2, "Progressive Design-Build": 3},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "D3": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "E1": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 3, "Design-Build/Low-Bid": 1, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 2, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "E2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 1, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 1, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 1, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "E3": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 1, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 3, "Design-Build/Low-Bid": 3, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "E4": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 3, "Design-Build/Low-Bid": 1, "Design-Build/Best-Value": 0, "CM/GC": 5, "Progressive Design-Build": 5},
+        "B": {"Design-Bid-Build": 2, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 5, "CM/GC": 0, "Progressive Design-Build": 0},
+    },
+    "E5": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "F1": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "F2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 5, "Progressive Design-Build": 2},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 3, "Design-Build/Best-Value": 5, "CM/GC": 0, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": None, "Design-Sequencing": None, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 0, "Progressive Design-Build": 5},
+    },
+    "F3": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "B": {"Design-Bid-Build": 2, "Design-Sequencing": 2, "Design-Build/Low-Bid": 3, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": None, "Design-Sequencing": None, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
     },
 }
+
 
 ALL_METHODS = [
     "Design-Bid-Build", "Design-Sequencing", "Design-Build/Low-Bid",
@@ -858,78 +983,65 @@ like 'this method is ideal.' Focus on what makes this project's constraints alig
 
 
 def score_all_methods(ratings: list) -> dict:
-    """Score ALL 6 delivery methods using the method-affinity matrix.
+    """Score ALL 6 delivery methods using the official Caltrans Selection Matrix.
+
+    Each question's selected answer maps to discrete point values per method.
+    A None value means "No-Go" (method disqualified). Highest total wins.
 
     Returns dict with:
       - method_scores: list of {method, score, rank, blocked, pros, cons, key_factors}
       - borderline_comparison: detailed comparison if top 2 are close
     """
-    # Build rating lookup
     rating_lookup = {}
-    section_ratings = {"A": [], "B": [], "C": [], "D": [], "E": [], "F": []}
+    rating_objs = {}
     for r in ratings:
         qid = r.get("question_id", "")
         rating = r.get("selected_rating", "B").upper()
-        if qid and qid[0] in section_ratings:
+        if qid:
             rating_lookup[qid] = rating
-            section_ratings[qid[0]].append(rating)
+            rating_objs[qid] = r
 
-    # Compute section-level dominant ratings (mode of A/B/C per section)
-    section_dominant = {}
-    for sec, rs in section_ratings.items():
-        if not rs:
-            section_dominant[sec] = "B"
-        else:
-            # Use average: A=3, B=2, C=1 -> map back
-            avg = sum(RATING_VALUES.get(r, 2) for r in rs) / len(rs)
-            if avg >= 2.5:
-                section_dominant[sec] = "A"
-            elif avg >= 1.5:
-                section_dominant[sec] = "B"
-            else:
-                section_dominant[sec] = "C"
-
-    # Score each method
+    # Score each method using SCORING_POINTS
     method_scores = []
     for method in ALL_METHODS:
-        weighted_sum = 0.0
+        total_points = 0
+        no_go = False
+        no_go_questions = []
         key_factors = []
-        for sec, weight in SECTION_WEIGHTS.items():
-            dominant = section_dominant.get(sec, "B")
-            affinity = METHOD_AFFINITY.get(sec, {}).get(method, {}).get(dominant, 0.5)
-            contribution = affinity * weight
-            weighted_sum += contribution
-            if affinity >= 0.8:
-                key_factors.append(f"{sec}: Strong fit ({dominant})")
-            elif affinity <= 0.2:
-                key_factors.append(f"{sec}: Poor fit ({dominant})")
+
+        for qid in [q["id"] for q in RUBRIC_QUESTIONS]:
+            sel = rating_lookup.get(qid, "B")
+            robj = rating_objs.get(qid)
+            pts = get_selection_matrix_points(qid, method, sel, robj)
+
+            if pts is None:
+                no_go = True
+                no_go_questions.append(qid)
+            else:
+                total_points += pts
+                if pts >= 10:
+                    key_factors.append(f"{qid}: Max points ({sel}={pts})")
+                elif pts == 0 and sel != "N/E":
+                    key_factors.append(f"{qid}: Zero points ({sel})")
 
         method_scores.append({
             "method": method,
-            "score": round(weighted_sum, 4),
-            "blocked": False,
-            "block_reasons": [],
+            "score": total_points,
+            "blocked": no_go,
+            "block_reasons": [f"No-Go on {q}" for q in no_go_questions] if no_go else [],
             "pros": _METHOD_PROS_CONS.get(method, {}).get("pros", []),
             "cons": _METHOD_PROS_CONS.get(method, {}).get("cons", []),
             "key_factors": key_factors[:5],
         })
 
-    # Apply override blocks
+    # Also apply override rules (supplement No-Go with rule-based blocks)
     override_status = _compute_override_status(rating_lookup)
-    blocked_methods = set()
     for o in override_status:
         if o["triggered"]:
-            for b in o.get("blocks", []):
-                blocked_methods.add(b)
-
-    for ms in method_scores:
-        if ms["method"] in blocked_methods:
-            ms["blocked"] = True
-            ms["block_reasons"] = [
-                o["rule_id"] + ": " + o["rule_name"]
-                for o in override_status
-                if o["triggered"] and ms["method"] in o.get("blocks", [])
-            ]
+            for ms in method_scores:
+                if ms["method"] in o.get("blocks", []) and not ms["blocked"]:
+                    ms["blocked"] = True
+                    ms["block_reasons"].append(f"{o['rule_id']}: {o['rule_name']}")
 
     # Rank (unblocked first, then by score descending)
     method_scores.sort(key=lambda x: (-int(not x["blocked"]), -x["score"]))
@@ -939,20 +1051,19 @@ def score_all_methods(ratings: list) -> dict:
     # Borderline comparison for top 2-3
     borderline_comparison = None
     unblocked = [ms for ms in method_scores if not ms["blocked"]]
-    
+
     if unblocked:
-        # Generate dynamic key factor logic for top method
         unblocked[0]["key_factors_reasoning"] = generate_key_factors_reasoning(
             unblocked[0]["method"],
             unblocked[0]["key_factors"],
-            ratings  # pass original list-of-dicts, not rating_lookup.values()
+            ratings
         )
 
-    if len(unblocked) >= 2 and (unblocked[0]["score"] - unblocked[1]["score"]) <= 0.05:
-        top_methods = unblocked[:3] if len(unblocked) >= 3 and (unblocked[0]["score"] - unblocked[2]["score"]) <= 0.10 else unblocked[:2]
+    if len(unblocked) >= 2 and (unblocked[0]["score"] - unblocked[1]["score"]) <= 5:
+        top_methods = unblocked[:3] if len(unblocked) >= 3 and (unblocked[0]["score"] - unblocked[2]["score"]) <= 10 else unblocked[:2]
         borderline_comparison = {
             "is_close": True,
-            "score_gap": round(unblocked[0]["score"] - unblocked[1]["score"], 4),
+            "score_gap": unblocked[0]["score"] - unblocked[1]["score"],
             "methods": [
                 {
                     "method": m["method"],
@@ -1062,90 +1173,6 @@ def run_validation_analysis(ai_ratings: list, user_ratings: dict) -> dict:
     }
 
 
-def _determine_method(composite: float, section_scores: dict, rating_lookup: dict) -> tuple:
-    """Determine the delivery method from composite and sub-scores.
-
-    Returns: (recommended, runner_up, is_borderline, comparison_text)
-    """
-    thresholds = [
-        (1.40, "Design-Bid-Build"),
-        (1.70, "Design-Sequencing"),
-        (2.10, None),  # Sub-score dependent
-        (2.50, None),  # Sub-score dependent
-        (3.01, "Progressive Design-Build"),
-    ]
-
-    # Check borderline (within 0.15 of a threshold boundary)
-    is_borderline = False
-    for t, _ in thresholds:
-        if abs(composite - t) < 0.15:
-            is_borderline = True
-            break
-
-    # Primary mapping
-    if composite <= 1.40:
-        recommended = "Design-Bid-Build"
-        runner_up = "Design-Sequencing"
-    elif composite <= 1.70:
-        recommended = "Design-Sequencing"
-        runner_up = "Design-Bid-Build" if composite < 1.55 else "CM/GC"
-    elif composite <= 2.10:
-        recommended, runner_up = _mid_range_method(section_scores, rating_lookup)
-    elif composite <= 2.50:
-        recommended, runner_up = _upper_range_method(section_scores, rating_lookup)
-    else:
-        recommended = "Progressive Design-Build"
-        runner_up = "CM/GC"
-
-    comparison = ""
-    if is_borderline:
-        comparison = _build_comparison(recommended, runner_up, composite, section_scores)
-
-    return recommended, runner_up, is_borderline, comparison
-
-
-def _mid_range_method(section_scores: dict, rating_lookup: dict) -> tuple:
-    """Determine method for composite scores 1.71-2.10.
-
-    In this mid-range, CM/GC is the most common recommendation because the
-    project is complex enough to benefit from collaboration but not so
-    extreme as to require full design-build risk transfer.
-    """
-    a_avg = section_scores.get("A", 2.0)
-    b_avg = section_scores.get("B", 2.0)
-    c_avg = section_scores.get("C", 2.0)
-    d_avg = section_scores.get("D", 2.0)
-    f_avg = section_scores.get("F", 2.0)
-
-    if b_avg >= 2.5 and c_avg >= 2.0:
-        # Strong schedule + innovation signals -> Design-Build
-        return "Design-Build/Best-Value", "CM/GC"
-    if b_avg >= 2.5 and c_avg < 2.0:
-        return "Design-Build/Low-Bid", "CM/GC"
-    # PDB only if complexity AND scope are both very high in mid-range
-    if a_avg >= 2.5 and rating_lookup.get("A3") == "C" and rating_lookup.get("E3") == "C":
-        return "Progressive Design-Build", "CM/GC"
-    # CM/GC is the default for mid-range — collaborative approach for complex projects
-    if c_avg >= 2.0:
-        return "CM/GC", "Design-Build/Best-Value"
-    return "CM/GC", "Design-Sequencing"
-
-
-def _upper_range_method(section_scores: dict, rating_lookup: dict) -> tuple:
-    """Determine method for composite scores 2.11-2.50."""
-    c_avg = section_scores.get("C", 2.0)
-    d_avg = section_scores.get("D", 2.0)
-    f_avg = section_scores.get("F", 2.0)
-
-    if c_avg < 1.5:
-        return "Design-Build/Low-Bid", "CM/GC"
-    if c_avg >= 2.0 and d_avg >= 2.0:
-        return "Design-Build/Best-Value", "Progressive Design-Build"
-    if f_avg >= 2.5:
-        return "CM/GC", "Progressive Design-Build"
-    if rating_lookup.get("A3") == "C" and rating_lookup.get("E3") == "C":
-        return "Progressive Design-Build", "Design-Build/Best-Value"
-    return "CM/GC", "Design-Build/Best-Value"
 
 
 # Fallback hierarchy: most flexible → most constrained
@@ -1343,56 +1370,51 @@ def _compute_override_status(rating_lookup: dict) -> list:
 def _build_comparison(
     recommended: str,
     runner_up: str,
-    composite: float,
+    composite,
     section_scores: dict,
-    method_affinity_scores: dict = None,
+    method_point_scores: dict = None,
 ) -> str:
     """Build a qualitative comparison for borderline cases.
 
     Args:
         recommended: Name of the recommended delivery method.
         runner_up: Name of the runner-up delivery method.
-        composite: Weighted composite score (1–3 scale).
-        section_scores: Average score per section (A–F) on the 1–3 scale.
-        method_affinity_scores: Optional dict mapping method names to their
-            0–1 affinity suitability scores. When provided, both the
-            recommended and runner-up scores are displayed so the reader can
-            judge how close the alternatives are.
+        composite: Total point score of recommended method.
+        section_scores: Point totals per section for the recommended method.
+        method_point_scores: Optional dict mapping method names to their
+            total point scores.
     """
-    if method_affinity_scores is None:
-        method_affinity_scores = {}
+    if method_point_scores is None:
+        method_point_scores = {}
 
-    rec_aff = method_affinity_scores.get(recommended)
-    rup_aff = method_affinity_scores.get(runner_up)
+    rec_pts = method_point_scores.get(recommended)
+    rup_pts = method_point_scores.get(runner_up)
 
-    # Header — composite score (1–3 rubric) and the two competing methods
     lines = [
-        f"**Project Composite Score: {composite:.2f} / 3.00**",
+        f"**Recommended Method Total Score: {composite} pts**",
         "",
-        f"The overall score places this project near the boundary between "
-        f"**{recommended}** and **{runner_up}**.",
+        f"**{recommended}** and **{runner_up}** scored competitively close.",
     ]
 
-    # Method suitability comparison (affinity scores, 0–1 scale)
-    if rec_aff is not None or rup_aff is not None:
+    if rec_pts is not None or rup_pts is not None:
         lines.append("")
-        lines.append("**Method Suitability (0 – 1 scale, higher = better fit):**")
-        rec_bar = int(round(rec_aff * 10)) if rec_aff is not None else None
-        rup_bar = int(round(rup_aff * 10)) if rup_aff is not None else None
-        if rec_aff is not None:
-            filled = "█" * rec_bar + "░" * (10 - rec_bar)
-            lines.append(f"- **{recommended}**: {rec_aff:.4f}  `{filled}`")
-        if rup_aff is not None:
-            filled = "█" * rup_bar + "░" * (10 - rup_bar)
-            lines.append(f"- **{runner_up}**: {rup_aff:.4f}  `{filled}`")
-        if rec_aff is not None and rup_aff is not None:
-            gap = rec_aff - rup_aff
-            lines.append(f"- Score gap: **{gap:+.4f}** — {'very close' if abs(gap) < 0.02 else 'close'}")
+        lines.append("**Method Scores (Selection Matrix points, higher = better fit):**")
+        max_pts = max(rec_pts or 0, rup_pts or 0, 1)
+        if rec_pts is not None:
+            bar_len = int(round(rec_pts / max_pts * 10))
+            filled = "█" * bar_len + "░" * (10 - bar_len)
+            lines.append(f"- **{recommended}**: {rec_pts} pts  `{filled}`")
+        if rup_pts is not None:
+            bar_len = int(round(rup_pts / max_pts * 10))
+            filled = "█" * bar_len + "░" * (10 - bar_len)
+            lines.append(f"- **{runner_up}**: {rup_pts} pts  `{filled}`")
+        if rec_pts is not None and rup_pts is not None:
+            gap = rec_pts - rup_pts
+            lines.append(f"- Score gap: **{gap:+d} pts** — {'very close' if abs(gap) <= 3 else 'close'}")
 
-    # Section-level breakdown
     lines.extend([
         "",
-        "**Section Scores (rubric 1–3 scale, weight applied to composite):**",
+        "**Section Point Breakdown (recommended method):**",
     ])
     section_names = {
         "A": "Project Scope & Characteristics",
@@ -1403,10 +1425,9 @@ def _build_comparison(
         "F": "Staffing Issues",
     }
     for s, name in section_names.items():
-        score = section_scores.get(s, 2.0)
-        lines.append(f"- {name}: {score:.2f} / 3.00 (weight: {SECTION_WEIGHTS[s]:.0%})")
+        score = section_scores.get(s, 0)
+        lines.append(f"- {name}: {score} pts")
 
-    # Closing guidance
     lines.extend([
         "",
         f"**{recommended}** is the primary recommendation, but **{runner_up}** scores "
@@ -1658,7 +1679,7 @@ def build_evaluation_excel(eval_data: dict, recommendation: dict, project_name: 
     # ===== Sheet 4: Multi-Method Comparison =====
     if multi_method_data:
         ws4 = wb.create_sheet("Method Comparison")
-        _title(ws4, "All Delivery Methods — Suitability Ranking", 7)
+        _title(ws4, "All Delivery Methods — Point Ranking", 7)
 
         headers4 = ["Rank", "Method", "Score", "Status", "Pros", "Cons", "Key Factors"]
         _header_row(ws4, 2, headers4)
@@ -1995,15 +2016,18 @@ def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_met
 
     curr += 1
 
-    # Score calculation
+    # Score calculation using official Selection Matrix points
     ws1_scores = {m: 0 for m in methods}
     ws2_scores = {m: 0 for m in methods}
     for q in q_list:
         qid = q["id"]
         sec = qid[0]
-        sel = rating_index.get(qid, {}).get("selected_rating", "B").upper()
+        robj = rating_index.get(qid, {})
+        sel = robj.get("selected_rating", "B").upper()
         for m in methods:
-            pts = METHOD_AFFINITY.get(sec, {}).get(m, {}).get(sel, 0.5) * 5
+            pts = get_selection_matrix_points(qid, m, sel, robj)
+            if pts is None:
+                pts = 0
             if sec == "A":
                 ws1_scores[m] += pts
             else:
@@ -2074,8 +2098,8 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
     # Points legend — explain the scoring formula once, right under the WS1 heading
     legend = ws.cell(row=curr, column=1,
         value="Scoring: Each question is rated A / B / C. "
-              "Points = Delivery Method Affinity (0.0 – 1.0) × 5 (max 5.0 per question). "
-              "A higher affinity score means the rating is a stronger fit for that delivery method.")
+              "Points are assigned per the official Caltrans Selection Matrix. "
+              "Method with the highest total score is recommended. 'No-Go' disqualifies a method.")
     legend.font = Font(italic=True, size=8, color="595959")
     legend.alignment = Alignment(wrap_text=True, horizontal="left", vertical="center")
     ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
@@ -2103,8 +2127,9 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
     a_questions = [q for q in q_list if q['id'].startswith("A")]
     for q in a_questions:
         qid = q["id"]
-        sel_rating = rating_index.get(qid, {}).get("selected_rating", "B").upper()
-        
+        robj = rating_index.get(qid, {})
+        sel_rating = robj.get("selected_rating", "B").upper()
+
         start_r = curr
         # Draw Question — merge cols 1+2 so the full 60px width is used and text wraps properly
         q_cell = ws.cell(row=curr, column=1, value=f"{qid}. {q['question']}")
@@ -2124,17 +2149,19 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
                 ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
                 curr += 1
                 opts_rendered += 1
-        
+
         # Total rows for this question (Question + Options)
         end_r = curr - 1
-        
+
         for ci, method in enumerate(methods):
             col = 3 + ci*2
-            # Calculate points
-            affinity = METHOD_AFFINITY.get("A", {}).get(method, {}).get(sel_rating, 0.5)
-            pts = round(affinity * 5, 1)
-            display_val = f"{sel_rating} ({pts})" if sel_rating else ""
-            
+            # Calculate points using Selection Matrix
+            pts = get_selection_matrix_points(qid, method, sel_rating, robj)
+            if pts is None:
+                display_val = "No-Go"
+            else:
+                display_val = f"{sel_rating} ({pts})" if sel_rating else ""
+
             # Merge BOTH sub-columns (col + col+1) horizontally AND all rows vertically
             col_end = col + 1
             ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
@@ -2210,8 +2237,9 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
         sec_questions = [q for q in q_list if q['id'].startswith(prefix)]
         for q in sec_questions:
             qid = q["id"]
-            sel_rating = rating_index.get(qid, {}).get("selected_rating", "B").upper()
-            
+            robj = rating_index.get(qid, {})
+            sel_rating = robj.get("selected_rating", "B").upper()
+
             start_r = curr
             # Question text — merge cols 1+2 so col B is not empty and text wraps
             q_cell = ws.cell(row=curr, column=1, value=f"{qid}. {q['question']}")
@@ -2229,17 +2257,19 @@ def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_sco
                     opt_cell.alignment = Alignment(wrap_text=True, vertical="top")
                     ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
                     curr += 1
-            
+
             # Total rows for this question
             end_r = curr - 1
-            
+
             for ci, method in enumerate(methods):
                 col = 3 + ci*2
-                # Calculate points
-                affinity = METHOD_AFFINITY.get(prefix, {}).get(method, {}).get(sel_rating, 0.5)
-                pts = round(affinity * 5, 1)
-                display_val = f"{sel_rating} ({pts})" if sel_rating else ""
-                
+                # Calculate points using Selection Matrix
+                pts = get_selection_matrix_points(qid, method, sel_rating, robj)
+                if pts is None:
+                    display_val = "No-Go"
+                else:
+                    display_val = f"{sel_rating} ({pts})" if sel_rating else ""
+
                 # Merge BOTH sub-columns horizontally AND all rows vertically
                 col_end = col + 1
                 ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
@@ -2349,8 +2379,11 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
             if not opt_text: continue
             display_text = f"☐ {opt_key}. {opt_text}"
             if single_method:
-                fit = METHOD_AFFINITY.get(sec, {}).get(single_method, {}).get(opt_key, 0.5)
-                display_text += f" [{fit * 5.0:.1f} pts]"
+                opt_pts = get_selection_matrix_points(qid, single_method, opt_key)
+                if opt_pts is None:
+                    display_text += " [No-Go]"
+                else:
+                    display_text += f" [{opt_pts} pts]"
             
             c_opt = ws.cell(row=current_row, column=2, value=display_text)
             c_opt.font = Font(size=9)
@@ -2366,8 +2399,9 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
                 ws.merge_cells(start_row=start_row, start_column=col, end_row=end_row, end_column=col)
         
         # Rating Cell (C)
-        affinity = METHOD_AFFINITY.get(sec, {}).get(single_method, {}).get(sel_rating, 0.5)
-        pts = round(affinity * 5, 1)
+        pts = get_selection_matrix_points(qid, single_method, sel_rating, robj)
+        if pts is None:
+            pts = 0
         
         # Color coding for Rating
         rating_color = "166534" if sel_rating == "A" else ("854D0E" if sel_rating == "B" else "991B1B")
