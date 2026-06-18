@@ -1,0 +1,11 @@
+{
+    "level_1_precedents": [
+        {
+            "target": "Narrative Declared PNW",
+            "correction": "4020287",
+            "human_reasoning": "we approximate it to the nearest dollar so that it is easy for calculation"
+        }
+    ],
+    "level_2_precedents": [],
+    "level_3_precedents": []
+}

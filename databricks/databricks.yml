@@ -8,7 +8,6 @@ sync:
   paths:
     - .
   exclude:
-    - build/
     - scripts/
     - README.md
     - .gitignore
@@ -18,7 +17,7 @@ resources:
   apps:
     caltrans_pde_app:
       name: caltrans-pde-app
-      description: Caltrans project delivery evaluator app for Databricks Apps.
+      description: Caltrans full AI application deployed on Databricks Apps.
       source_code_path: .
 
 targets:

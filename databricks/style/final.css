@@ -1,0 +1,333 @@
+/* ==========================================================================
+   Global Theme & Resets
+   ========================================================================== */
+/* Force main background and text color to ensure high contrast */
+[data-testid="stAppViewContainer"] {
+    background-color: white !important;
+    color: black !important;
+}
+
+/* Ensure all text elements inherit the black color unless overridden */
+[data-testid="stAppViewContainer"] p,
+[data-testid="stAppViewContainer"] h1,
+[data-testid="stAppViewContainer"] h2,
+[data-testid="stAppViewContainer"] h3,
+[data-testid="stAppViewContainer"] h4,
+[data-testid="stAppViewContainer"] h5,
+[data-testid="stAppViewContainer"] h6,
+[data-testid="stAppViewContainer"] span,
+[data-testid="stAppViewContainer"] div {
+    color: black;
+}
+
+/* Header Background */
+header[data-testid="stHeader"] {
+    background: white !important;
+}
+
+/* ==========================================================================
+   Sidebar Styling
+   ========================================================================== */
+/* Sidebar Background - Blue */
+section[data-testid="stSidebar"] {
+    background-color: #3b82c8 !important;
+}
+
+/* Sidebar Text - White (exclude button internals) */
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] div,
+section[data-testid="stSidebar"] label {
+    color: white !important;
+}
+
+/* Sidebar Buttons - Modern gradient accent */
+section[data-testid="stSidebar"] button {
+    background: linear-gradient(135deg, #ffffff, #f0f2f6) !important;
+    color: #1a1a2e !important;
+    border: 1px solid rgba(255, 255, 255, 0.5) !important;
+    font-weight: 600 !important;
+    border-radius: 10px !important;
+    letter-spacing: 0.02em !important;
+    transition: all 0.2s ease !important;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08) !important;
+}
+
+section[data-testid="stSidebar"] button p,
+section[data-testid="stSidebar"] button span,
+section[data-testid="stSidebar"] button div {
+    color: #1a1a2e !important;
+}
+
+section[data-testid="stSidebar"] button:hover {
+    background: linear-gradient(135deg, #f0f2f6, #e2e8f0) !important;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12) !important;
+    transform: translateY(-1px);
+}
+
+/* Sidebar Input Labels */
+section[data-testid="stSidebar"] .stMarkdown p {
+    color: white !important;
+    font-weight: 500;
+}
+
+/* Sidebar Clear/Reset Button */
+/* Targeting the specific form submit button in sidebar */
+section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"] {
+    width: 100%;
+    border-radius: 10px;
+    background-color: #32CD32 !important;
+    border-color: #32CD32 !important;
+    color: white !important;
+    font-weight: bold;
+}
+
+section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"] p,
+section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"] span,
+section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"] div {
+    color: white !important;
+}
+
+section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"]:hover {
+    background-color: #28a428 !important;
+    border-color: #28a428 !important;
+    color: white !important;
+}
+
+/* ==========================================================================
+   Fix: Sidebar Dropdown Text Visibility
+   The dropdown INPUT boxes have white background, so text must be dark
+   AGGRESSIVE FIX - target all possible text elements
+   ========================================================================== */
+/* Force dark text on ALL elements inside sidebar selectbox */
+section[data-testid="stSidebar"] [data-testid="stSelectbox"] * {
+    color: #31333F !important;
+}
+
+/* Specifically target the value container div */
+section[data-testid="stSidebar"] [data-testid="stSelectbox"] div {
+    color: #31333F !important;
+}
+
+/* Target any span that might contain the selected value */
+section[data-testid="stSidebar"] [data-testid="stSelectbox"] span {
+    color: #31333F !important;
+}
+
+/* Dropdown arrow should also be dark */
+section[data-testid="stSidebar"] [data-testid="stSelectbox"] svg {
+    fill: #31333F !important;
+}
+
+/* Target the baseweb select component specifically */
+section[data-testid="stSidebar"] [data-baseweb="select"] {
+    color: #31333F !important;
+}
+
+section[data-testid="stSidebar"] [data-baseweb="select"] * {
+    color: #31333F !important;
+}
+
+/* Dropdown menu options (when opened) - popover is outside sidebar */
+[data-baseweb="popover"] ul li {
+    color: #31333F !important;
+}
+
+/* ==========================================================================
+   Fix: Clear/Reset Button (HTML form submit)
+   ========================================================================== */
+section[data-testid="stSidebar"] input[type="submit"] {
+    width: 100%;
+    height: 45px;
+    border-radius: 10px;
+    background: #32CD32 !important;
+    border: 2px solid #32CD32 !important;
+    color: white !important;
+    font-weight: bold;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+section[data-testid="stSidebar"] input[type="submit"]:hover {
+    background: #28a428 !important;
+    border-color: #28a428 !important;
+}
+
+/* ==========================================================================
+   Scrollable Content Layout
+   ========================================================================== */
+/* Main container - clean, transparent */
+.block-container {
+    padding-top: 1rem !important;
+    padding-bottom: 1rem !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+    background-color: transparent !important;
+}
+
+
+/* Make sidebar images smaller */
+section[data-testid="stSidebar"] img {
+    max-width: 50px !important;
+    height: auto;
+}
+
+/* Header Text Styling */
+h1,
+h2,
+h3 {
+    font-family: 'Century Gothic', sans-serif !important;
+    font-weight: bold !important;
+}
+
+/* ==========================================================================
+   File Uploader - Force Light Mode
+   ========================================================================== */
+[data-testid="stFileUploader"],
+[data-testid="stFileUploader"] * {
+    color: #31333F !important;
+}
+
+[data-testid="stFileUploader"] section {
+    background-color: #f8f9fa !important;
+    border: 1px dashed #cbd5e1 !important;
+    border-radius: 8px !important;
+}
+
+[data-testid="stFileUploader"] section svg {
+    fill: #64748b !important;
+    stroke: #64748b !important;
+}
+
+[data-testid="stFileUploader"] section small,
+[data-testid="stFileUploader"] section span,
+[data-testid="stFileUploader"] section p {
+    color: #64748b !important;
+}
+
+[data-testid="stFileUploader"] button {
+    background-color: white !important;
+    color: #31333F !important;
+    border: 1px solid #e2e8f0 !important;
+}
+
+/* Force all SVG icons in main area to dark */
+[data-testid="stAppViewContainer"] svg {
+    fill: #31333F !important;
+}
+
+/* Except sidebar SVGs stay white */
+section[data-testid="stSidebar"] svg {
+    fill: white !important;
+}
+
+/* Sidebar selectbox SVGs need to be dark */
+section[data-testid="stSidebar"] [data-testid="stSelectbox"] svg {
+    fill: #31333F !important;
+}
+
+/* ==========================================================================
+   Custom Components
+   ========================================================================== */
+/* Login/Input Area Alignment */
+div[data-testid="stTextInput"] {
+    width: 100%;
+}
+
+/* Submit Buttons in Main Area (Green) */
+/* Using a general attribute selector for primary buttons if needed, 
+   or specific hierarchy if they are dynamically generated */
+div.stButton>button {
+    background-color: #3b82c8;
+    color: white;
+    border-radius: 6px;
+    border: none;
+    padding: 0.5rem 1rem;
+    transition: all 0.3s ease;
+}
+
+div.stButton>button:hover {
+    background-color: #2563eb;
+    color: white;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+/* Success/Info Messages */
+.stAlert {
+    background-color: #f0f9ff;
+    border: 1px solid #bae6fd;
+    color: #0369a1;
+}
+
+/* ==========================================================================
+   Chat Bubble Container
+   ========================================================================== */
+/* White bubble container for chat messages with shadow and scroll */
+.chat-bubble-container {
+    background-color: white;
+    border-radius: 15px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1), 0 2px 4px rgba(0, 0, 0, 0.06);
+    padding: 1.5rem;
+    margin: 1rem 0;
+    max-height: 400px;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+/* Custom scrollbar for the chat bubble */
+.chat-bubble-container::-webkit-scrollbar {
+    width: 6px;
+}
+
+.chat-bubble-container::-webkit-scrollbar-track {
+    background: #f1f5f9;
+    border-radius: 3px;
+}
+
+.chat-bubble-container::-webkit-scrollbar-thumb {
+    background: #94a3b8;
+    border-radius: 3px;
+}
+
+.chat-bubble-container::-webkit-scrollbar-thumb:hover {
+    background: #64748b;
+}
+
+/* ==========================================================================
+   Table & Markdown Grid Styling
+   ========================================================================== */
+/* Ensure tables have clear borders and a professional "outline" look */
+table {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    margin: 1.5rem 0 !important;
+    border: 1px solid #31333F !important;
+}
+
+th {
+    background-color: #f8f9fa !important;
+    color: #31333F !important;
+    font-weight: bold !important;
+    border: 1px solid #31333F !important;
+    padding: 12px !important;
+    text-align: left !important;
+    text-transform: uppercase !important;
+    font-size: 0.85rem !important;
+}
+
+td {
+    border: 1px solid #31333F !important;
+    padding: 10px 12px !important;
+    color: black !important;
+    vertical-align: top !important;
+    font-size: 0.9rem !important;
+}
+
+tr:nth-child(even) {
+    background-color: #fcfcfc !important;
+}
+
+/* Ensure markdown rendering doesn't strip borders */
+[data-testid="stMarkdown"] table {
+    border: 1px solid #31333F !important;
+}

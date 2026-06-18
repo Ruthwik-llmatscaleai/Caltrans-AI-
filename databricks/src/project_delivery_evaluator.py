@@ -1,37 +1,70 @@
 import json
 import datetime
+import re
+import logging
+import os
+import openpyxl
 from io import BytesIO
 from openai import OpenAI
 from docx import Document
+from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+from openpyxl.utils import get_column_letter
 from src.delivery_method_kb import DELIVERY_METHOD_KB_TEXT
+from src.databricks_client import MODEL_GPT4O, MODEL_GPT4O_MINI
 
-def _get_client(model_name: str = "databricks-gemma-3-12b-it"):
+def _get_client(model_name: str = None):
     """
-    Direct Databricks Gemma Connector:
-    Uses native App Identity (Service Principal) to authenticate.
-    No hardcoded tokens required.
+    Databricks-first LLM Client.
+    Uses the native Databricks service principal auth.
     """
-    from databricks.sdk import WorkspaceClient
-    from openai import OpenAI
-    
+    from src.databricks_client import get_openai_client
+    return get_openai_client()
+
+def _extract_json(text: str, finish_reason: str = "unknown") -> dict:
+    """
+    Robustly extract JSON from a string that might contain markdown blocks or leading/trailing text.
+    Provides diagnostic info if parsing fails.
+    """
+    if not text or not text.strip():
+        raise ValueError(f"AI response was empty (Finish Reason: {finish_reason}).")
+
+    # Clean the input
+    text = text.strip()
+
+    # Try direct parse first (fastest)
     try:
-        # Use the Databricks SDK to fetch the auto-injected App Identity token
-        w = WorkspaceClient()
-        auth_data = w.config.authenticate()
-        token = auth_data.get("Authorization", "").replace("Bearer ", "")
-        
-        return OpenAI(
-            api_key=token,
-            base_url=f"{w.config.host.rstrip('/')}/serving-endpoints"
-        )
-    except Exception as e:
-        # Emergency fallback for local testing if the SDK is not available
-        import os
-        token = os.getenv("DATABRICKS_TOKEN")
-        host = os.getenv("DATABRICKS_HOST")
-        if token and host:
-             return OpenAI(api_key=token, base_url=f"{host.rstrip('/')}/serving-endpoints")
-        raise Exception(f"Databricks Authentication Failed. Please ensure this app is running within a Databricks App environment or that DATABRICKS_TOKEN/HOST are set locally. Error: {str(e)}")
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try regex for markdown block ```json ... ```
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if match:
+        try:
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # Try regex for just ``` ... ```
+    match = re.search(r"```\s*([\s\S]*?)```", text)
+    if match:
+        try:
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # Last resort: find start and end braces
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace != -1:
+        try:
+            return json.loads(text[first_brace:last_brace+1])
+        except json.JSONDecodeError:
+            pass
+
+    # If all failed, provide a sample of the actual response for debugging
+    sample = (text[:200] + "...") if len(text) > 200 else text
+    raise ValueError(f"Could not parse AI response as JSON. Finish Reason: {finish_reason}. Raw Output Start: {sample}")
 
 # ==============================================================================
 # RUBRIC: 25 Questions extracted from AltDeliveryNominFactSheet Tables 3-8
@@ -232,19 +265,55 @@ SECTION_WEIGHTS = {
 
 RATING_VALUES = {"A": 1, "B": 2, "C": 3}
 
+def get_selection_matrix_points(qid: str, method: str, sel_rating: str, rating_obj: dict = None):
+    """Return the Selection Matrix point value for a question/method/answer.
+
+    Returns None if the method is disqualified ("No-Go") for this answer.
+    Returns 0 if missing evidence (N/E) or missing_info=True.
+    """
+    if sel_rating in ("N/E", "NE", "N_E"):
+        return 0
+    if rating_obj and rating_obj.get("missing_info", False):
+        return 0
+    q_points = SCORING_POINTS.get(qid, {})
+    opt_points = q_points.get(sel_rating, {})
+    return opt_points.get(method, 0)
+
+
+
 
 # ==============================================================================
 # DOCUMENT EXTRACTION
 # ==============================================================================
 def extract_text_from_uploaded_pdf(file) -> str:
-    """Extract text from an uploaded PDF file object."""
+    """Extract text from an uploaded PDF file object.
+
+    Truncates at appendix headers (CM Tasks, Glossary, signature page) so the
+    narrative-only content is sent to the LLM, mirroring extract_text_from_docx.
+    """
     from PyPDF2 import PdfReader
     reader = PdfReader(file)
+    stop_keywords = [
+        "Construction Manager Tasks",
+        "Glossary of Preconstruction",
+        "District Single Point Signature",
+        "Project Risk Assessment",
+    ]
     text = ""
     for page in reader.pages:
         page_text = page.extract_text()
-        if page_text:
-            text += page_text + "\n"
+        if not page_text:
+            continue
+        kept_lines = []
+        truncated = False
+        for line in page_text.splitlines():
+            if any(kw.lower() in line.lower() for kw in stop_keywords):
+                truncated = True
+                break
+            kept_lines.append(line)
+        text += "\n".join(kept_lines) + "\n"
+        if truncated:
+            break
     return text
 
 
@@ -267,11 +336,11 @@ def extract_multi_doc_context(files) -> str:
     return "\n\n".join(combined_text)
 
 
-def extract_text_from_docx(file) -> tuple:
-    """Extract narrative text and any pre-filled ratings from a nomination fact sheet DOCX.
+def extract_text_from_docx(file) -> str:
+    """Extract narrative text from a nomination fact sheet DOCX.
 
     Returns:
-        (narrative_text, existing_ratings) where existing_ratings is a dict like {"A1": "B", ...}
+        narrative_text (str): The extracted text from the document.
     """
     doc = Document(file)
 
@@ -292,23 +361,7 @@ def extract_text_from_docx(file) -> tuple:
         narrative_parts.append(text)
     narrative_text = "\n".join(narrative_parts)
 
-    # Extract pre-filled ratings from Tables 3-8 (evaluation question tables)
-    existing_ratings = {}
-    for table in doc.tables:
-        if len(table.columns) != 3:
-            continue
-        header_cells = [cell.text.strip().upper() for cell in table.rows[0].cells]
-        if "QUESTION NO." not in header_cells[0] and "QUESTION" not in header_cells[0]:
-            continue
-        # This is a rubric question table
-        for row in table.rows[1:]:
-            cells = [cell.text.strip() for cell in row.cells]
-            question_id = cells[0].strip()
-            rating_text = cells[2].strip().upper() if len(cells) > 2 else ""
-            if question_id and rating_text in ("A", "B", "C"):
-                existing_ratings[question_id] = rating_text
-
-    return narrative_text, existing_ratings
+    return narrative_text
 
 
 def load_delivery_method_kb() -> str:
@@ -335,8 +388,14 @@ def _build_rubric_text() -> str:
     return "\n".join(lines)
 
 
-def _build_system_prompt(kb_text: str, existing_ratings: dict = None) -> str:
-    """Build the full system prompt for the delivery evaluation."""
+def _build_system_prompt(kb_text: str, existing_ratings: dict = None, pde_rules: list = None) -> str:
+    """Build the full system prompt for the delivery evaluation.
+
+    Args:
+        kb_text: Delivery method knowledge base text.
+        existing_ratings: Optional district pre-filled ratings.
+        pde_rules: Optional list of approved institutional memory rules from pde_memory_manager.
+    """
 
     persona = """You are a Senior Alternative Contracting Expert at Caltrans Headquarters, Office of Innovative Design and Delivery (OIDD). You have 20+ years of experience evaluating project delivery method nominations across California. Your role is to objectively evaluate a district's nomination fact sheet against the 25-question delivery selection rubric.
 
@@ -369,41 +428,56 @@ Design-Sequencing is NOT in the comparison PDF above. Key characteristics:
 For questions using "No more than typical / More than typical / Much more than typical", use these guidelines:
 - A (No more than typical): Standard Caltrans project, no unusual factors
 - B (More than typical): Notable complexity or needs beyond standard, but manageable
-- C (Much more than typical): Exceptional complexity, significant challenges requiring specialized approaches"""
+- C (Much more than typical): Exceptional complexity, significant challenges requiring specialized approaches
+
+"""
 
     few_shot = """EVALUATION METHODOLOGY:
 For each of the 25 questions, follow this chain-of-thought:
-1. EXTRACT: Find all evidence in the narrative relevant to this question. Quote or summarize directly.
+1. EXTRACT: Find ALL evidence in the narrative relevant to this question. Quote the EXACT sentence(s).
 2. ANALYZE: Apply the rubric criteria. Compare evidence against options A, B, and C.
-3. RATE: Select the rating that best matches.
-4. FLAG: If insufficient evidence, set missing_info to true and estimate using domain knowledge. Lower confidence to 0.2-0.4 for estimates.
+3. RATE: Select the rating that best matches the evidence found.
+4. FLAG: If insufficient evidence, set missing_info to true and explain in missing_info_reasoning how that gap would shift the delivery method recommendation.
 
-When a question has no direct evidence, check if related questions provide indirect evidence. For example, if A3 (complexity) has evidence of high complexity, that indirectly supports higher ratings for C1 (innovation opportunity) and B1 (fast-tracking benefit).
+CRITICAL ANTI-FABRICATION RULE:
+- If the document does NOT contain evidence for a question, source_reasoning MUST state ONLY: "No direct evidence found in the document for this criterion."
+- Do NOT pull from unrelated sections to justify a rating. Do NOT infer from general project characteristics that do not directly address the specific criterion.
+- Example of WRONG behavior: Question asks about procurement cost impact on bidders, AI references "project was approved for CMGC" — this does NOT answer the question about procurement cost.
+- When evidence is absent, do NOT select a rating. Set selected_rating to "N/E" (No Evidence). This question will receive zero scoring weight and will be flagged for human review.
+
+For source_reasoning: ALWAYS quote the exact text from the document with its section, then state your inference. If no evidence exists, state "No direct evidence found in the document for this criterion." and STOP — do not elaborate with unrelated content.
+For missing_info_reasoning: If data is missing, explain what is missing AND which delivery methods would be higher/lower priority if that data were available.
 
 EXAMPLE 1 - Question A2 (Project Size):
-extracted_evidence: "The construction capital cost is estimated at $45 million."
-rubric_analysis: "$45M falls between $25M and $75M per Caltrans thresholds for A2."
+source_reasoning: "Section 4 (Financial Summary): 'The engineer\'s estimate for construction capital is $48.7 million.' — This places the project squarely in the B ($25–75M) band per Caltrans baseline norms. Conclusion: Rating B."
+missing_info_reasoning: "None — all evidence present. Construction cost is explicitly stated."
 selected_rating: "B"
 confidence: 0.95
 missing_info: false
 
 EXAMPLE 2 - Question A7 (Utility/Third-Party Issues):
-extracted_evidence: "The project requires coordination with BNSF railroad for track closures and PG&E for gas line relocation. Multiple utility relocations are anticipated."
-rubric_analysis: "Railroad and utility coordination involving multiple parties goes beyond typical. Two major utility entities plus railroad suggests 'More than typical' but not necessarily 'Much more than typical' unless additional complexity exists."
-selected_rating: "B"
+source_reasoning: "Section 7 (Utilities): 'The project requires coordination with BNSF railroad for track closures and PG&E for gas line relocation. Multiple utility relocations are anticipated.' — Multiple third-party utility relocations exceeding typical scope. Conclusion: Rating C."
+missing_info_reasoning: "Section 7 references BNSF right-of-way entry agreements as pending. If these agreements cannot be secured, schedule risk increases significantly, further favouring CMGC or PDB over DBB to allow early contractor involvement in negotiations."
+selected_rating: "C"
 confidence: 0.85
 missing_info: false
 
-EXAMPLE 3 - Question C1 (Innovation) with missing info:
-extracted_evidence: "No explicit discussion of innovation opportunities found in the narrative."
-rubric_analysis: "The narrative does not address innovation. Based on the project's complexity (if A3 suggests moderate complexity) and highway scope, moderate innovation potential is plausible but unconfirmed."
-selected_rating: "B"
-confidence: 0.35
+EXAMPLE 3 - Question D3 (Warranties) with missing info:
+source_reasoning: "No direct evidence found in the document for this criterion."
+missing_info_reasoning: "The narrative does not discuss warranty or maintenance agreement plans. If warranties are planned, CM/GC and Design-Build methods would score higher as they facilitate negotiated warranty terms during preconstruction."
+selected_rating: "N/E"
+confidence: 0.90
 missing_info: true"""
 
     exclusion = """IMPORTANT EXCLUSIONS:
-- Do NOT evaluate any content from Sections 13, 14, or 15 of the fact sheet (Risk Register, CMGC Task Selection, Glossary).
-- Evaluate ONLY based on the project narrative from Sections 1-12 and any supplementary project details.
+- Do NOT evaluate any content from appendix sections of the fact sheet. These vary by template:
+    * Generic Alt Delivery template: Sections 13, 14, 15 (Risk Register, CMGC Task Selection, Glossary).
+    * CMGC Nomination Fact Sheet template: "Construction Manager Tasks", "Risk Identification and Mitigation",
+      "Schedule Risk Analysis/Control", "Glossary of Preconstruction Services Terms", "District Single Point Signature".
+- Evaluate ONLY based on the project narrative — typically numbered sections 1 through 8 (CMGC template) or
+  1 through 12 (generic Alt Delivery template) and any supplementary project details before the appendices.
+- Risk titles that appear in the narrative body (e.g., "RISK: Railroad Coordination" inside Section 9) ARE in scope;
+  the standalone CM Tasks appendix and Glossary are NOT.
 - Your evaluation must cover ALL 25 questions (A1 through F3). Do not skip any."""
 
     existing_ratings_text = ""
@@ -412,7 +486,16 @@ missing_info: true"""
         existing_ratings_text = f"""
 DISTRICT PRE-FILLED RATINGS:
 The district has pre-filled these ratings: {ratings_str}
-Evaluate independently based on the evidence. After your independent evaluation, if your rating differs from the district's, note the disagreement in your rubric_analysis."""
+Evaluate independently based on the evidence. After your independent evaluation, if your rating differs from the district's, note the disagreement in your effect_on_method."""
+
+    # Inject approved institutional memory rules if provided
+    institutional_memory_text = ""
+    if pde_rules:
+        try:
+            from src.pde_memory_manager import build_institutional_memory_block
+            institutional_memory_text = build_institutional_memory_block(pde_rules)
+        except Exception:
+            pass  # Never crash evaluation due to memory module failure
 
     output_schema = """OUTPUT FORMAT:
 You must output ONLY valid JSON in the following format. Replace all placeholders with real values extracted from the narrative.
@@ -426,29 +509,36 @@ You must output ONLY valid JSON in the following format. Replace all placeholder
     {
       "question_id": "A1",
       "question_text": "Where is the Project in the project development process?",
-      "extracted_evidence": "<direct quote or summary from narrative, or 'No direct evidence found'>",
-      "rubric_analysis": "<chain-of-thought reasoning explaining how the evidence maps to the selected rating>",
-      "selected_rating": "A or B or C",
-      "confidence": 0.0 to 1.0,
-      "missing_info": true or false
+      "source_reasoning": "<Section [X]: 'exact quote from narrative' — 1-sentence inference explaining how this quote leads to the selected rating. If no evidence exists, state ONLY: 'No direct evidence found in the document for this criterion.' — do NOT elaborate.>",
+      "missing_info_reasoning": "<If missing_info is true: state exactly what is missing AND explain which delivery methods would be re-ranked if that data were available (e.g., 'If utility costs exceed $5M, shifts from DBB to CMGC/PDB'). If missing_info is false: 'None — all evidence present.'>",
+      "selected_rating": "A or B or C or N/E (use N/E when missing_info is true)",
+      "confidence": 0.0,
+      "missing_info": false
     }
   ],
   "missing_questions": ["list of question_ids where missing_info is true"],
   "summary": "<2-3 sentence overall assessment of the project and evaluation quality>"
 }
 
-CRITICAL: The "ratings" array must contain EXACTLY 25 items, one for each question A1 through F3, in order."""
+CRITICAL: The "ratings" array must contain EXACTLY 25 items, one for each question A1 through F3, in order.
+CRITICAL: source_reasoning MUST contain a direct quote from the document wherever evidence exists — do NOT paraphrase.
+CRITICAL: Do NOT include an effect_on_method field — that analysis belongs inside missing_info_reasoning."""
 
-    return "\n\n".join([
+    parts = [
         persona, kb_section, design_sequencing, rubric_text,
-        baseline_norms, few_shot, exclusion, existing_ratings_text, output_schema
-    ])
+        baseline_norms, few_shot, exclusion, existing_ratings_text,
+    ]
+    if institutional_memory_text:
+        parts.append(institutional_memory_text)
+    parts.append(output_schema)
+    return "\n\n".join(parts)
 
 
 # ==============================================================================
 # CORE EVALUATION FUNCTION
 # ==============================================================================
-def run_delivery_evaluation(narrative_text: str, kb_text: str, existing_ratings: dict = None, model_name: str = "gpt-4o") -> dict:
+def run_delivery_evaluation(narrative_text: str, kb_text: str, existing_ratings: dict = None,
+                            model_name: str = None, pde_rules: list = None) -> dict:
     """Run the 25-question delivery method evaluation using an LLM.
 
     Args:
@@ -456,16 +546,20 @@ def run_delivery_evaluation(narrative_text: str, kb_text: str, existing_ratings:
         kb_text: Text from the DeliveryMethodComparison PDF
         existing_ratings: Optional dict of district pre-filled ratings {"A1": "B", ...}
         model_name: The LLM model/endpoint to use (defaults to gpt-4o)
+        pde_rules: Optional list of approved rules from pde_memory_manager for institutional memory injection.
 
     Returns:
         Dict with evaluation results or {"error": "..."} on failure
     """
-    system_prompt = _build_system_prompt(kb_text, existing_ratings)
+    system_prompt = _build_system_prompt(kb_text, existing_ratings, pde_rules=pde_rules)
 
     user_message = f"""Please evaluate the following Alternative Delivery Nomination Fact Sheet against all 25 rubric questions.
 
 NOMINATION FACT SHEET CONTENT:
 {narrative_text}"""
+
+    if not model_name:
+        model_name = MODEL_GPT4O
 
     try:
         client = _get_client(model_name)
@@ -478,9 +572,13 @@ NOMINATION FACT SHEET CONTENT:
             ],
             temperature=0.0,
         )
+
+        main_text = response.choices[0].message.content
+        main_reason = response.choices[0].finish_reason
+
         try:
-            return json.loads(response.choices[0].message.content)
-        except json.JSONDecodeError:
+            return _extract_json(main_text, finish_reason=main_reason)
+        except (json.JSONDecodeError, ValueError):
             # Retry once on malformed JSON
             retry = client.chat.completions.create(
                 model=model_name,
@@ -491,7 +589,9 @@ NOMINATION FACT SHEET CONTENT:
                 ],
                 temperature=0.0,
             )
-            return json.loads(retry.choices[0].message.content)
+            retry_text = retry.choices[0].message.content
+            retry_reason = retry.choices[0].finish_reason
+            return _extract_json(retry_text, finish_reason=retry_reason)
     except Exception as e:
         return {"error": f"AI service error during delivery evaluation: {str(e)}"}
 
@@ -500,7 +600,10 @@ NOMINATION FACT SHEET CONTENT:
 # SCORING MATRIX & DELIVERY METHOD RECOMMENDATION
 # ==============================================================================
 def compute_delivery_recommendation(ratings: list) -> dict:
-    """Apply weighted scoring matrix to 25 A/B/C ratings and recommend a delivery method.
+    """Apply the official Caltrans Selection Matrix point system to recommend a delivery method.
+
+    Uses SCORING_POINTS: each question × answer × method → discrete points.
+    Method with highest total wins. None values = No-Go (disqualified).
 
     Args:
         ratings: List of 25 dicts with "question_id" and "selected_rating" keys
@@ -508,75 +611,115 @@ def compute_delivery_recommendation(ratings: list) -> dict:
     Returns:
         Dict with composite_score, section_scores, recommended_method, etc.
     """
-    # Group ratings by section
-    section_ratings = {"A": [], "B": [], "C": [], "D": [], "E": [], "F": []}
     rating_lookup = {}
+    rating_objs = {}
     for r in ratings:
         qid = r.get("question_id", "")
         rating = r.get("selected_rating", "B").upper()
-        if qid and qid[0] in section_ratings:
-            section_ratings[qid[0]].append(RATING_VALUES.get(rating, 2))
+        if qid:
             rating_lookup[qid] = rating
+            rating_objs[qid] = r
 
-    # Compute section averages
-    section_scores = {}
-    for section, values in section_ratings.items():
-        section_scores[section] = sum(values) / len(values) if values else 2.0
+    # Compute per-method total scores using Selection Matrix points
+    method_totals = {m: 0 for m in ALL_METHODS}
+    method_no_go = {m: False for m in ALL_METHODS}
+    method_section_scores = {m: {"A": 0, "B": 0, "C": 0, "D": 0, "E": 0, "F": 0} for m in ALL_METHODS}
 
-    # Compute weighted composite score
-    composite = sum(
-        section_scores[s] * SECTION_WEIGHTS[s] for s in SECTION_WEIGHTS
-    )
+    for qid in [q["id"] for q in RUBRIC_QUESTIONS]:
+        sel = rating_lookup.get(qid, "B")
+        robj = rating_objs.get(qid)
+        sec = qid[0] if qid else ""
+        for method in ALL_METHODS:
+            pts = get_selection_matrix_points(qid, method, sel, robj)
+            if pts is None:
+                method_no_go[method] = True
+            else:
+                method_totals[method] += pts
+                if sec in method_section_scores[method]:
+                    method_section_scores[method][sec] += pts
 
-    # Determine recommended method
-    recommended, runner_up, is_borderline, comparison = _determine_method(
-        composite, section_scores, rating_lookup
-    )
+    # Rank eligible methods by total score
+    eligible = [(m, method_totals[m]) for m in ALL_METHODS if not method_no_go[m]]
+    eligible.sort(key=lambda x: -x[1])
 
-    # Apply document-based override rules
+    if eligible:
+        recommended = eligible[0][0]
+        recommended_score = eligible[0][1]
+        runner_up = eligible[1][0] if len(eligible) > 1 else "N/A"
+        runner_up_score = eligible[1][1] if len(eligible) > 1 else None
+    else:
+        recommended = ALL_METHODS[0]
+        recommended_score = method_totals[recommended]
+        runner_up = "N/A"
+        runner_up_score = None
+
+    # Borderline: top 2 within 5 points
+    is_borderline = (runner_up_score is not None and (recommended_score - runner_up_score) <= 5)
+
+    # Apply override rules
     recommended, runner_up, override_reasons = _apply_overrides(
         recommended, runner_up, rating_lookup
     )
 
-    # Recompute borderline comparison if override changed the recommendation
-    if override_reasons and is_borderline:
-        comparison = _build_comparison(recommended, runner_up, composite, section_scores)
+    # Recompute scores after override swap
+    recommended_score = method_totals.get(recommended, 0)
+    runner_up_score = method_totals.get(runner_up, 0) if runner_up and runner_up != "N/A" else None
 
-    # --- Phase 2 Enhancements ---
-    # Raw scores: numeric value per question
+    # Section scores (using the recommended method's breakdown)
+    section_scores = {}
+    for sec in ["A", "B", "C", "D", "E", "F"]:
+        section_scores[sec] = method_section_scores.get(recommended, {}).get(sec, 0)
+
+    # Composite = total score of recommended method (for display purposes)
+    composite = recommended_score
+
+    # Build comparison text
+    method_point_scores = {recommended: recommended_score}
+    if runner_up and runner_up != "N/A" and runner_up_score is not None:
+        method_point_scores[runner_up] = runner_up_score
+
+    comparison = _build_comparison(
+        recommended, runner_up, composite, section_scores, method_point_scores
+    )
+
+    # Raw scores per question (numeric rating value for legacy compat)
     raw_scores = {qid: RATING_VALUES.get(r, 2) for qid, r in rating_lookup.items()}
 
-    # Weighted scores: section_avg × section_weight
-    weighted_scores = {s: round(section_scores[s] * SECTION_WEIGHTS[s], 4) for s in SECTION_WEIGHTS}
+    # Weighted scores = section point totals for recommended method
+    weighted_scores = {s: section_scores.get(s, 0) for s in ["A", "B", "C", "D", "E", "F"]}
 
-    # Override status: evaluate all 9 rules, mark triggered or not
+    # Override status
     override_status = _compute_override_status(rating_lookup)
 
-    # Key drivers: top 5 questions by weighted contribution
-    question_weights = []
-    for qid, raw in raw_scores.items():
-        sec = qid[0]
-        sec_count = len(section_ratings.get(sec, [1]))
-        per_q_weight = SECTION_WEIGHTS.get(sec, 0) / max(sec_count, 1)
-        question_weights.append({
+    # Key drivers: questions contributing most points to the recommended method
+    question_points = []
+    for qid in [q["id"] for q in RUBRIC_QUESTIONS]:
+        sel = rating_lookup.get(qid, "B")
+        robj = rating_objs.get(qid)
+        pts = get_selection_matrix_points(qid, recommended, sel, robj)
+        if pts is None:
+            pts = 0
+        question_points.append({
             "question_id": qid,
-            "raw_score": raw,
+            "raw_score": pts,
             "rating": rating_lookup.get(qid, "B"),
-            "section": sec,
-            "weighted_contribution": round(raw * per_q_weight, 4),
+            "section": qid[0] if qid else "",
+            "weighted_contribution": pts,
         })
-    question_weights.sort(key=lambda x: x["weighted_contribution"], reverse=True)
-    key_drivers = question_weights[:5]
+    question_points.sort(key=lambda x: -x["weighted_contribution"])
+    key_drivers = question_points[:5]
 
     return {
-        "composite_score": round(composite, 3),
-        "section_scores": {k: round(v, 3) for k, v in section_scores.items()},
+        "composite_score": composite,
+        "section_scores": section_scores,
         "raw_scores": raw_scores,
         "weighted_scores": weighted_scores,
         "override_status": override_status,
         "key_drivers": key_drivers,
         "recommended_method": recommended,
+        "recommended_score": recommended_score,
         "runner_up_method": runner_up,
+        "runner_up_score": runner_up_score,
         "is_borderline": is_borderline,
         "comparison_text": comparison,
         "override_reasons": override_reasons,
@@ -584,70 +727,141 @@ def compute_delivery_recommendation(ratings: list) -> dict:
 
 
 # ==============================================================================
-# MULTI-METHOD SCORING  (Req 3.1)
+# MULTI-METHOD SCORING — Official Caltrans Selection Matrix Point System
 # ==============================================================================
 
-# Method-affinity matrix derived from the Caltrans Delivery Method Comparison KB.
-# Each section maps to how strongly an "A" vs "C" rating favors each method.
-# Values: 1.0 = strongly favors, 0.5 = neutral, 0.0 = disfavors.
-# A rating of "C" (high complexity/need) is mapped using the "C" column;
-# "A" (simple/traditional) uses the "A" column; "B" interpolates.
-_METHOD_AFFINITY = {
-    # Section A: Project Scope & Characteristics — high complexity favors CMGC/DB/PDB
-    "A": {
-        "Design-Bid-Build":        {"A": 1.0, "B": 0.6, "C": 0.1},
-        "Design-Sequencing":       {"A": 0.8, "B": 0.6, "C": 0.2},
-        "Design-Build/Low-Bid":    {"A": 0.3, "B": 0.5, "C": 0.7},
-        "Design-Build/Best-Value": {"A": 0.2, "B": 0.5, "C": 0.8},
-        "CM/GC":                   {"A": 0.3, "B": 0.6, "C": 0.9},
-        "Progressive Design-Build":{"A": 0.1, "B": 0.4, "C": 0.9},
+# Point scoring table extracted from the official Caltrans Project Delivery
+# Selection Tool (Selection Matrix). Each question × answer × method maps to
+# discrete point values. None = "No-Go" (method is disqualified).
+# Progressive Design-Build uses the same values as CM/GC except where noted.
+SCORING_POINTS = {
+    "A1": {
+        "A": {"Design-Bid-Build": 10, "Design-Sequencing": 0, "Design-Build/Low-Bid": None, "Design-Build/Best-Value": None, "CM/GC": None, "Progressive Design-Build": None},
+        "B": {"Design-Bid-Build": 10, "Design-Sequencing": 10, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 10, "Design-Sequencing": 10, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
     },
-    # Section B: Schedule Issues — urgency favors DB, CMGC, PDB
-    "B": {
-        "Design-Bid-Build":        {"A": 0.9, "B": 0.5, "C": 0.1},
-        "Design-Sequencing":       {"A": 0.7, "B": 0.5, "C": 0.3},
-        "Design-Build/Low-Bid":    {"A": 0.3, "B": 0.6, "C": 0.8},
-        "Design-Build/Best-Value": {"A": 0.3, "B": 0.6, "C": 0.8},
-        "CM/GC":                   {"A": 0.4, "B": 0.6, "C": 0.8},
-        "Progressive Design-Build":{"A": 0.3, "B": 0.5, "C": 0.8},
+    "A2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 3, "Design-Sequencing": 3, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 3, "Design-Sequencing": 0, "Design-Build/Low-Bid": 3, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
     },
-    # Section C: Innovation — high innovation favors DB/BV, CMGC, PDB
-    "C": {
-        "Design-Bid-Build":        {"A": 0.9, "B": 0.5, "C": 0.1},
-        "Design-Sequencing":       {"A": 0.7, "B": 0.5, "C": 0.2},
-        "Design-Build/Low-Bid":    {"A": 0.4, "B": 0.5, "C": 0.6},
-        "Design-Build/Best-Value": {"A": 0.2, "B": 0.5, "C": 0.9},
-        "CM/GC":                   {"A": 0.3, "B": 0.6, "C": 0.8},
-        "Progressive Design-Build":{"A": 0.2, "B": 0.5, "C": 0.9},
+    "A3": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 3, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 2, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 3, "CM/GC": 3, "Progressive Design-Build": 3},
+        "C": {"Design-Bid-Build": 2, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
     },
-    # Section D: Quality Enhancement — high quality needs favor DB/BV, CMGC
-    "D": {
-        "Design-Bid-Build":        {"A": 0.8, "B": 0.5, "C": 0.2},
-        "Design-Sequencing":       {"A": 0.7, "B": 0.5, "C": 0.3},
-        "Design-Build/Low-Bid":    {"A": 0.5, "B": 0.5, "C": 0.5},
-        "Design-Build/Best-Value": {"A": 0.3, "B": 0.5, "C": 0.8},
-        "CM/GC":                   {"A": 0.3, "B": 0.6, "C": 0.8},
-        "Progressive Design-Build":{"A": 0.3, "B": 0.5, "C": 0.8},
+    "A4": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 7, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
     },
-    # Section E: Cost Issues — constrained funding favors DBB; full funding favors DB
-    "E": {
-        "Design-Bid-Build":        {"A": 0.8, "B": 0.6, "C": 0.3},
-        "Design-Sequencing":       {"A": 0.7, "B": 0.5, "C": 0.3},
-        "Design-Build/Low-Bid":    {"A": 0.3, "B": 0.5, "C": 0.7},
-        "Design-Build/Best-Value": {"A": 0.2, "B": 0.5, "C": 0.7},
-        "CM/GC":                   {"A": 0.4, "B": 0.6, "C": 0.7},
-        "Progressive Design-Build":{"A": 0.2, "B": 0.5, "C": 0.8},
+    "A5": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 7, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
     },
-    # Section F: Staffing — lack of expertise favors DB, PDB, CMGC
-    "F": {
-        "Design-Bid-Build":        {"A": 0.8, "B": 0.5, "C": 0.1},
-        "Design-Sequencing":       {"A": 0.7, "B": 0.5, "C": 0.2},
-        "Design-Build/Low-Bid":    {"A": 0.4, "B": 0.5, "C": 0.6},
-        "Design-Build/Best-Value": {"A": 0.3, "B": 0.5, "C": 0.7},
-        "CM/GC":                   {"A": 0.5, "B": 0.6, "C": 0.7},
-        "Progressive Design-Build":{"A": 0.3, "B": 0.5, "C": 0.8},
+    "A6": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 7, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
+    },
+    "A7": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 5, "Progressive Design-Build": 5},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
+    },
+    "A8": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
+    },
+    "A9": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 5, "Progressive Design-Build": 5},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 10, "Progressive Design-Build": 10},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
+    },
+    "A10": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 10, "Design-Build/Best-Value": 10, "CM/GC": 10, "Progressive Design-Build": 10},
+    },
+    "B1": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 3, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 6, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "B2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 3, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 5, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 6, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "C1": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "C2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 5, "Progressive Design-Build": 5},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 2, "Progressive Design-Build": 2},
+    },
+    "D1": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "D2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 2, "Progressive Design-Build": 3},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "D3": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "E1": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 3, "Design-Build/Low-Bid": 1, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 2, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "E2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 1, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 1, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 1, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "E3": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 1, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 3, "Design-Build/Low-Bid": 3, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "E4": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 3, "Design-Build/Low-Bid": 1, "Design-Build/Best-Value": 0, "CM/GC": 5, "Progressive Design-Build": 5},
+        "B": {"Design-Bid-Build": 2, "Design-Sequencing": 2, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 5, "CM/GC": 0, "Progressive Design-Build": 0},
+    },
+    "E5": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "F1": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 2, "Design-Build/Low-Bid": 0, "Design-Build/Best-Value": 0, "CM/GC": 0, "Progressive Design-Build": 0},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "C": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+    },
+    "F2": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 5, "Progressive Design-Build": 2},
+        "B": {"Design-Bid-Build": 0, "Design-Sequencing": 0, "Design-Build/Low-Bid": 3, "Design-Build/Best-Value": 5, "CM/GC": 0, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": None, "Design-Sequencing": None, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 0, "Progressive Design-Build": 5},
+    },
+    "F3": {
+        "A": {"Design-Bid-Build": 5, "Design-Sequencing": 5, "Design-Build/Low-Bid": 2, "Design-Build/Best-Value": 2, "CM/GC": 2, "Progressive Design-Build": 2},
+        "B": {"Design-Bid-Build": 2, "Design-Sequencing": 2, "Design-Build/Low-Bid": 3, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
+        "C": {"Design-Bid-Build": None, "Design-Sequencing": None, "Design-Build/Low-Bid": 5, "Design-Build/Best-Value": 5, "CM/GC": 5, "Progressive Design-Build": 5},
     },
 }
+
 
 ALL_METHODS = [
     "Design-Bid-Build", "Design-Sequencing", "Design-Build/Low-Bid",
@@ -683,79 +897,127 @@ _METHOD_PROS_CONS = {
 }
 
 
+def generate_key_factors_reasoning(method: str, key_factors: list, ratings: list) -> str:
+    """Generate a plain-English 2-sentence explanation for why the top-ranked delivery
+    method scored highest, using only the source_quotes already extracted in the evaluation.
+
+    This deliberately avoids re-sending the full narrative PDF to keep token cost minimal.
+    Falls back to an empty string on any failure — the caller shows static key_factors instead.
+
+    Args:
+        method: The recommended delivery method name.
+        key_factors: List of static key factor strings (e.g. ["A: Strong fit (C)"]).
+        ratings: The full 25-rating list from run_delivery_evaluation (contains source_reasoning per question).
+
+    Returns:
+        A 2-sentence plain-English explanation or "" on failure.
+    """
+    # Collect only the source_reasoning quotes for sections that are "Strong fit" or "Poor fit"
+    relevant_sections = set()
+    for kf in key_factors:
+        if kf and ":" in kf:
+            relevant_sections.add(kf.split(":")[0].strip())
+
+    evidence_snippets = []
+    for r in ratings:
+        if not isinstance(r, dict):  # guard against strings or unexpected types
+            continue
+        qid = r.get("question_id", "")
+        sec = qid[0] if qid else ""
+        if sec in relevant_sections:
+            quote = r.get("source_reasoning", "")
+            if quote and quote.strip() and "No direct evidence" not in quote:
+                # Truncate long quotes to keep prompt compact
+                snippet = quote[:300] + "..." if len(quote) > 300 else quote
+                evidence_snippets.append(f"[{qid}] {snippet}")
+
+    if not evidence_snippets:
+        return ""
+
+    prompt_system = f"""You are a Caltrans delivery method advisor. Based on the evaluation evidence below, 
+write exactly 2 sentences explaining in plain English why '{method}' is the best fit for this project. 
+Be specific — reference the actual project characteristics mentioned in the evidence. Do not use vague phrases 
+like 'this method is ideal.' Focus on what makes this project's constraints align with {method}."""
+
+    prompt_user = "Evaluation evidence:\n" + "\n".join(evidence_snippets[:8])  # cap at 8 snippets
+
+    try:
+        client = _get_client()
+        response = client.chat.completions.create(
+            model=MODEL_GPT4O_MINI,
+            messages=[
+                {"role": "system", "content": prompt_system},
+                {"role": "user", "content": prompt_user},
+            ],
+            temperature=0.2,
+            max_tokens=120,
+            timeout=15,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return ""  # Always fail gracefully — caller shows static key_factors
+
+
 def score_all_methods(ratings: list) -> dict:
-    """Score ALL 6 delivery methods using the method-affinity matrix.
+    """Score ALL 6 delivery methods using the official Caltrans Selection Matrix.
+
+    Each question's selected answer maps to discrete point values per method.
+    A None value means "No-Go" (method disqualified). Highest total wins.
 
     Returns dict with:
       - method_scores: list of {method, score, rank, blocked, pros, cons, key_factors}
       - borderline_comparison: detailed comparison if top 2 are close
     """
-    # Build rating lookup
     rating_lookup = {}
-    section_ratings = {"A": [], "B": [], "C": [], "D": [], "E": [], "F": []}
+    rating_objs = {}
     for r in ratings:
         qid = r.get("question_id", "")
         rating = r.get("selected_rating", "B").upper()
-        if qid and qid[0] in section_ratings:
+        if qid:
             rating_lookup[qid] = rating
-            section_ratings[qid[0]].append(rating)
+            rating_objs[qid] = r
 
-    # Compute section-level dominant ratings (mode of A/B/C per section)
-    section_dominant = {}
-    for sec, rs in section_ratings.items():
-        if not rs:
-            section_dominant[sec] = "B"
-        else:
-            # Use average: A=3, B=2, C=1 -> map back
-            avg = sum(RATING_VALUES.get(r, 2) for r in rs) / len(rs)
-            if avg >= 2.5:
-                section_dominant[sec] = "A"
-            elif avg >= 1.5:
-                section_dominant[sec] = "B"
-            else:
-                section_dominant[sec] = "C"
-
-    # Score each method
+    # Score each method using SCORING_POINTS
     method_scores = []
     for method in ALL_METHODS:
-        weighted_sum = 0.0
+        total_points = 0
+        no_go = False
+        no_go_questions = []
         key_factors = []
-        for sec, weight in SECTION_WEIGHTS.items():
-            dominant = section_dominant.get(sec, "B")
-            affinity = _METHOD_AFFINITY.get(sec, {}).get(method, {}).get(dominant, 0.5)
-            contribution = affinity * weight
-            weighted_sum += contribution
-            if affinity >= 0.8:
-                key_factors.append(f"{sec}: Strong fit ({dominant})")
-            elif affinity <= 0.2:
-                key_factors.append(f"{sec}: Poor fit ({dominant})")
+
+        for qid in [q["id"] for q in RUBRIC_QUESTIONS]:
+            sel = rating_lookup.get(qid, "B")
+            robj = rating_objs.get(qid)
+            pts = get_selection_matrix_points(qid, method, sel, robj)
+
+            if pts is None:
+                no_go = True
+                no_go_questions.append(qid)
+            else:
+                total_points += pts
+                if pts >= 10:
+                    key_factors.append(f"{qid}: Max points ({sel}={pts})")
+                elif pts == 0 and sel != "N/E":
+                    key_factors.append(f"{qid}: Zero points ({sel})")
 
         method_scores.append({
             "method": method,
-            "score": round(weighted_sum, 4),
-            "blocked": False,
-            "block_reasons": [],
+            "score": total_points,
+            "blocked": no_go,
+            "block_reasons": [f"No-Go on {q}" for q in no_go_questions] if no_go else [],
             "pros": _METHOD_PROS_CONS.get(method, {}).get("pros", []),
             "cons": _METHOD_PROS_CONS.get(method, {}).get("cons", []),
             "key_factors": key_factors[:5],
         })
 
-    # Apply override blocks
+    # Also apply override rules (supplement No-Go with rule-based blocks)
     override_status = _compute_override_status(rating_lookup)
-    blocked_methods = set()
     for o in override_status:
         if o["triggered"]:
-            for b in o.get("blocks", []):
-                blocked_methods.add(b)
-
-    for ms in method_scores:
-        if ms["method"] in blocked_methods:
-            ms["blocked"] = True
-            ms["block_reasons"] = [
-                o["rule_id"] + ": " + o["rule_name"]
-                for o in override_status
-                if o["triggered"] and ms["method"] in o.get("blocks", [])
-            ]
+            for ms in method_scores:
+                if ms["method"] in o.get("blocks", []) and not ms["blocked"]:
+                    ms["blocked"] = True
+                    ms["block_reasons"].append(f"{o['rule_id']}: {o['rule_name']}")
 
     # Rank (unblocked first, then by score descending)
     method_scores.sort(key=lambda x: (-int(not x["blocked"]), -x["score"]))
@@ -765,11 +1027,19 @@ def score_all_methods(ratings: list) -> dict:
     # Borderline comparison for top 2-3
     borderline_comparison = None
     unblocked = [ms for ms in method_scores if not ms["blocked"]]
-    if len(unblocked) >= 2 and (unblocked[0]["score"] - unblocked[1]["score"]) <= 0.05:
-        top_methods = unblocked[:3] if len(unblocked) >= 3 and (unblocked[0]["score"] - unblocked[2]["score"]) <= 0.10 else unblocked[:2]
+
+    if unblocked:
+        unblocked[0]["key_factors_reasoning"] = generate_key_factors_reasoning(
+            unblocked[0]["method"],
+            unblocked[0]["key_factors"],
+            ratings
+        )
+
+    if len(unblocked) >= 2 and (unblocked[0]["score"] - unblocked[1]["score"]) <= 5:
+        top_methods = unblocked[:3] if len(unblocked) >= 3 and (unblocked[0]["score"] - unblocked[2]["score"]) <= 10 else unblocked[:2]
         borderline_comparison = {
             "is_close": True,
-            "score_gap": round(unblocked[0]["score"] - unblocked[1]["score"], 4),
+            "score_gap": unblocked[0]["score"] - unblocked[1]["score"],
             "methods": [
                 {
                     "method": m["method"],
@@ -811,7 +1081,7 @@ def run_validation_analysis(ai_ratings: list, user_ratings: dict) -> dict:
         user_rating = user_ratings.get(qid, "").upper()
 
         if not user_rating:
-            continue
+            user_rating = ai_rating
 
         ai_val = RATING_VALUES.get(ai_rating, 2)
         user_val = RATING_VALUES.get(user_rating, 2)
@@ -820,7 +1090,10 @@ def run_validation_analysis(ai_ratings: list, user_ratings: dict) -> dict:
         if diff == 0:
             severity = "match"
         elif diff == 1:
-            severity = "minor_mismatch"
+            # Upgrade minor → major when AI confidence is high (≥75%)
+            # High confidence means the AI is near-certain; an override carries more weight
+            ai_confidence = r.get("confidence", 0)
+            severity = "major_mismatch" if ai_confidence >= 0.75 else "minor_mismatch"
         else:
             severity = "major_mismatch"
 
@@ -830,7 +1103,7 @@ def run_validation_analysis(ai_ratings: list, user_ratings: dict) -> dict:
             "ai_rating": ai_rating,
             "user_rating": user_rating,
             "severity": severity,
-            "ai_evidence": r.get("extracted_evidence", ""),
+            "ai_evidence": r.get("source_reasoning", r.get("extracted_evidence", "No reasoning available")),
             "ai_confidence": round(r.get("confidence", 0), 2),
             "has_evidence": r.get("confidence", 0) >= 0.4,
         }
@@ -876,90 +1149,6 @@ def run_validation_analysis(ai_ratings: list, user_ratings: dict) -> dict:
     }
 
 
-def _determine_method(composite: float, section_scores: dict, rating_lookup: dict) -> tuple:
-    """Determine the delivery method from composite and sub-scores.
-
-    Returns: (recommended, runner_up, is_borderline, comparison_text)
-    """
-    thresholds = [
-        (1.40, "Design-Bid-Build"),
-        (1.70, "Design-Sequencing"),
-        (2.10, None),  # Sub-score dependent
-        (2.50, None),  # Sub-score dependent
-        (3.01, "Progressive Design-Build"),
-    ]
-
-    # Check borderline (within 0.15 of a threshold boundary)
-    is_borderline = False
-    for t, _ in thresholds:
-        if abs(composite - t) < 0.15:
-            is_borderline = True
-            break
-
-    # Primary mapping
-    if composite <= 1.40:
-        recommended = "Design-Bid-Build"
-        runner_up = "Design-Sequencing"
-    elif composite <= 1.70:
-        recommended = "Design-Sequencing"
-        runner_up = "Design-Bid-Build" if composite < 1.55 else "CM/GC"
-    elif composite <= 2.10:
-        recommended, runner_up = _mid_range_method(section_scores, rating_lookup)
-    elif composite <= 2.50:
-        recommended, runner_up = _upper_range_method(section_scores, rating_lookup)
-    else:
-        recommended = "Progressive Design-Build"
-        runner_up = "CM/GC"
-
-    comparison = ""
-    if is_borderline:
-        comparison = _build_comparison(recommended, runner_up, composite, section_scores)
-
-    return recommended, runner_up, is_borderline, comparison
-
-
-def _mid_range_method(section_scores: dict, rating_lookup: dict) -> tuple:
-    """Determine method for composite scores 1.71-2.10.
-
-    In this mid-range, CM/GC is the most common recommendation because the
-    project is complex enough to benefit from collaboration but not so
-    extreme as to require full design-build risk transfer.
-    """
-    a_avg = section_scores.get("A", 2.0)
-    b_avg = section_scores.get("B", 2.0)
-    c_avg = section_scores.get("C", 2.0)
-    d_avg = section_scores.get("D", 2.0)
-    f_avg = section_scores.get("F", 2.0)
-
-    if b_avg >= 2.5 and c_avg >= 2.0:
-        # Strong schedule + innovation signals -> Design-Build
-        return "Design-Build/Best-Value", "CM/GC"
-    if b_avg >= 2.5 and c_avg < 2.0:
-        return "Design-Build/Low-Bid", "CM/GC"
-    # PDB only if complexity AND scope are both very high in mid-range
-    if a_avg >= 2.5 and rating_lookup.get("A3") == "C" and rating_lookup.get("E3") == "C":
-        return "Progressive Design-Build", "CM/GC"
-    # CM/GC is the default for mid-range — collaborative approach for complex projects
-    if c_avg >= 2.0:
-        return "CM/GC", "Design-Build/Best-Value"
-    return "CM/GC", "Design-Sequencing"
-
-
-def _upper_range_method(section_scores: dict, rating_lookup: dict) -> tuple:
-    """Determine method for composite scores 2.11-2.50."""
-    c_avg = section_scores.get("C", 2.0)
-    d_avg = section_scores.get("D", 2.0)
-    f_avg = section_scores.get("F", 2.0)
-
-    if c_avg < 1.5:
-        return "Design-Build/Low-Bid", "CM/GC"
-    if c_avg >= 2.0 and d_avg >= 2.0:
-        return "Design-Build/Best-Value", "Progressive Design-Build"
-    if f_avg >= 2.5:
-        return "CM/GC", "Progressive Design-Build"
-    if rating_lookup.get("A3") == "C" and rating_lookup.get("E3") == "C":
-        return "Progressive Design-Build", "Design-Build/Best-Value"
-    return "CM/GC", "Design-Build/Best-Value"
 
 
 # Fallback hierarchy: most flexible → most constrained
@@ -1154,15 +1343,55 @@ def _compute_override_status(rating_lookup: dict) -> list:
     return statuses
 
 
-def _build_comparison(recommended: str, runner_up: str, composite: float, section_scores: dict) -> str:
-    """Build a qualitative comparison for borderline cases."""
+def _build_comparison(
+    recommended: str,
+    runner_up: str,
+    composite,
+    section_scores: dict,
+    method_point_scores: dict = None,
+) -> str:
+    """Build a qualitative comparison for borderline cases.
+
+    Args:
+        recommended: Name of the recommended delivery method.
+        runner_up: Name of the runner-up delivery method.
+        composite: Total point score of recommended method.
+        section_scores: Point totals per section for the recommended method.
+        method_point_scores: Optional dict mapping method names to their
+            total point scores.
+    """
+    if method_point_scores is None:
+        method_point_scores = {}
+
+    rec_pts = method_point_scores.get(recommended)
+    rup_pts = method_point_scores.get(runner_up)
+
     lines = [
-        f"**Score: {composite:.2f} / 3.00**",
+        f"**Recommended Method Total Score: {composite} pts**",
         "",
-        f"The scores place this project near the boundary between **{recommended}** and **{runner_up}**.",
-        "",
-        "**Section Scores:**",
+        f"**{recommended}** and **{runner_up}** scored competitively close.",
     ]
+
+    if rec_pts is not None or rup_pts is not None:
+        lines.append("")
+        lines.append("**Method Scores (Selection Matrix points, higher = better fit):**")
+        max_pts = max(rec_pts or 0, rup_pts or 0, 1)
+        if rec_pts is not None:
+            bar_len = int(round(rec_pts / max_pts * 10))
+            filled = "█" * bar_len + "░" * (10 - bar_len)
+            lines.append(f"- **{recommended}**: {rec_pts} pts  `{filled}`")
+        if rup_pts is not None:
+            bar_len = int(round(rup_pts / max_pts * 10))
+            filled = "█" * bar_len + "░" * (10 - bar_len)
+            lines.append(f"- **{runner_up}**: {rup_pts} pts  `{filled}`")
+        if rec_pts is not None and rup_pts is not None:
+            gap = rec_pts - rup_pts
+            lines.append(f"- Score gap: **{gap:+d} pts** — {'very close' if abs(gap) <= 3 else 'close'}")
+
+    lines.extend([
+        "",
+        "**Section Point Breakdown (recommended method):**",
+    ])
     section_names = {
         "A": "Project Scope & Characteristics",
         "B": "Schedule Issues",
@@ -1172,14 +1401,15 @@ def _build_comparison(recommended: str, runner_up: str, composite: float, sectio
         "F": "Staffing Issues",
     }
     for s, name in section_names.items():
-        score = section_scores.get(s, 2.0)
-        lines.append(f"- {name}: {score:.2f} / 3.00 (weight: {SECTION_WEIGHTS[s]:.0%})")
+        score = section_scores.get(s, 0)
+        lines.append(f"- {name}: {score} pts")
 
     lines.extend([
         "",
-        f"**{recommended}** is recommended as the primary method, but the project team should also evaluate "
-        f"**{runner_up}** given the proximity of scores. Consider the specific project constraints, district "
-        f"experience with each method, and stakeholder preferences when making the final decision.",
+        f"**{recommended}** is the primary recommendation, but **{runner_up}** scores "
+        f"competitively close. Consider district experience with each method, "
+        f"stakeholder preferences, and any project constraints not captured in the rubric "
+        f"before making the final decision.",
     ])
     return "\n".join(lines)
 
@@ -1187,46 +1417,123 @@ def _build_comparison(recommended: str, runner_up: str, composite: float, sectio
 # ==============================================================================
 # EXCEL EXPORT
 # ==============================================================================
+
+# Shared styles for Excel generation
+def _get_styles():
+    styles = {}
+    styles['hdr_fill'] = PatternFill("solid", fgColor="1F4E79")
+    styles['hdr_font'] = Font(bold=True, color="FFFFFF", size=11)
+    styles['even_fill'] = PatternFill("solid", fgColor="EBF3FB")
+    styles['grey_fill'] = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+    styles['header_fill_v2'] = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    
+    styles['bdr'] = Border(
+        left=Side("thin", "000000"), right=Side("thin", "000000"),
+        top=Side("thin", "000000"), bottom=Side("thin", "000000"),
+    )
+    styles['thin_side'] = Side(border_style="thin", color="000000")
+    
+    styles['wrap'] = Alignment(wrap_text=True, vertical="top")
+    styles['center'] = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    styles['top_left'] = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    
+    styles['bold'] = Font(bold=True)
+    styles['bold_font'] = styles['bold'] # Alias for legacy/V2 consistency
+    styles['blue_bold'] = Font(bold=True, size=11, color="0000FF")
+    styles['italic_small'] = Font(italic=True, size=9)
+    styles['bold_12'] = Font(bold=True, size=12)
+    return styles
+
+def _title(ws, text, cols):
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=cols)
+    c = ws.cell(row=1, column=1, value=text)
+    c.font = Font(bold=True, size=14, color="1F4E79")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+def _header_row(ws, row, headers):
+    s = _get_styles()
+    for ci, h in enumerate(headers, 1):
+        c = ws.cell(row=row, column=ci, value=h)
+        c.font, c.fill, c.border, c.alignment = s['hdr_font'], s['hdr_fill'], s['bdr'], s['center']
+
+def _data_row(ws, row, values):
+    s = _get_styles()
+    fill = s['even_fill'] if row % 2 == 0 else None
+    for ci, val in enumerate(values, 1):
+        c = ws.cell(row=row, column=ci, value=val)
+        c.border, c.alignment = s['bdr'], s['wrap']
+        if fill:
+            c.fill = fill
+    return fill
+
+def _used_bounds(ws):
+    max_r = 0
+    max_c = 0
+    for r in range(1, ws.max_row + 1):
+        row_has_data = False
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=r, column=c).value
+            if v is not None and str(v).strip() != "":
+                row_has_data = True
+                max_c = max(max_c, c)
+        if row_has_data:
+            max_r = r
+    return max_r, max_c
+
+def _apply_template_design(ws):
+    from openpyxl.styles import Alignment
+    s = _get_styles()
+    max_r, max_c = _used_bounds(ws)
+    if max_r == 0 or max_c == 0:
+        return
+
+    ws.freeze_panes = "A2"
+    ws.sheet_view.zoomScale = 90
+
+    # Base styling on all used cells
+    for r in range(1, max_r + 1):
+        ws.row_dimensions[r].height = 20
+        non_empty = 0
+        row_texts = []
+        for c in range(1, max_c + 1):
+            cell = ws.cell(row=r, column=c)
+            val = cell.value
+            txt = str(val).strip() if val is not None else ""
+            if txt:
+                non_empty += 1
+                row_texts.append(txt.lower())
+            cell.font = s['body_font']
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            cell.border = s['bdr']
+
+        row_blob = " ".join(row_texts)
+        is_title = ("project delivery selection tool" in row_blob) or ("project summary worksheet" in row_blob)
+        is_header = any(keyword in row_blob for keyword in ["question", "worksheet", "scoring summary", "final selection", "criteria"])
+        
+        if is_title:
+            for c in range(1, max_c + 1):
+                cell = ws.cell(row=r, column=c)
+                cell.font = s['title_font']
+                if cell.value is not None and str(cell.value).strip():
+                    cell.fill = s['template_hdr_fill']
+                    cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+            ws.row_dimensions[r].height = 24
+        elif is_header:
+            for c in range(1, max_c + 1):
+                cell = ws.cell(row=r, column=c)
+                if cell.value is not None and str(cell.value).strip():
+                    cell.fill = s['template_subhdr_fill']
+                    cell.font = s['subhdr_font']
+
 def build_evaluation_excel(eval_data: dict, recommendation: dict, project_name: str,
                            multi_method_data: dict = None, validation_data: dict = None) -> BytesIO:
     """Build a styled 5-sheet Excel workbook with full analysis."""
     import openpyxl
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-
+    from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+    center = Alignment(horizontal="center", vertical="center")
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
-
-    # --- Shared styles ---
-    hdr_fill = PatternFill("solid", fgColor="1F4E79")
-    hdr_font = Font(bold=True, color="FFFFFF", size=11)
-    even_fill = PatternFill("solid", fgColor="EBF3FB")
-    bdr = Border(
-        left=Side("thin", "000000"), right=Side("thin", "000000"),
-        top=Side("thin", "000000"), bottom=Side("thin", "000000"),
-    )
-    wrap = Alignment(wrap_text=True, vertical="top")
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    def _title(ws, text, cols):
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=cols)
-        c = ws.cell(row=1, column=1, value=text)
-        c.font = Font(bold=True, size=14, color="1F4E79")
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[1].height = 30
-
-    def _header_row(ws, row, headers):
-        for ci, h in enumerate(headers, 1):
-            c = ws.cell(row=row, column=ci, value=h)
-            c.font, c.fill, c.border, c.alignment = hdr_font, hdr_fill, bdr, center
-
-    def _data_row(ws, row, values):
-        fill = even_fill if row % 2 == 0 else PatternFill()
-        for ci, val in enumerate(values, 1):
-            c = ws.cell(row=row, column=ci, value=val)
-            c.border, c.alignment = bdr, wrap
-            if fill.fill_type:
-                c.fill = fill
-        return fill
 
     # ===== Sheet 1: Executive Dashboard =====
     ws1 = wb.create_sheet("Dashboard")
@@ -1348,7 +1655,7 @@ def build_evaluation_excel(eval_data: dict, recommendation: dict, project_name: 
     # ===== Sheet 4: Multi-Method Comparison =====
     if multi_method_data:
         ws4 = wb.create_sheet("Method Comparison")
-        _title(ws4, "All Delivery Methods — Suitability Ranking", 7)
+        _title(ws4, "All Delivery Methods — Point Ranking", 7)
 
         headers4 = ["Rank", "Method", "Score", "Status", "Pros", "Cons", "Key Factors"]
         _header_row(ws4, 2, headers4)
@@ -1467,3 +1774,797 @@ def build_evaluation_excel(eval_data: dict, recommendation: dict, project_name: 
     wb.save(buf)
     buf.seek(0)
     return buf
+
+
+def _safe_sheet_title(title: str) -> str:
+    """Return an Excel-safe sheet title (max 31 chars)."""
+    invalid = ['\\', '/', '*', '?', ':', '[', ']']
+    safe = title
+    for ch in invalid:
+        safe = safe.replace(ch, "-")
+    return safe[:31]
+
+
+def _apply_box_border(ws, start_row, start_col, end_row, end_col):
+    """Utility to apply a thin border around a rectangular range of cells."""
+    from openpyxl.styles import Border, Side
+    thin = Side(border_style="thin", color="000000")
+    for r in range(start_row, end_row + 1):
+        for c in range(start_col, end_col + 1):
+            cell = ws.cell(row=r, column=c)
+            # Maintain existing border if any
+            current = cell.border
+            new_top = thin if r == start_row else current.top
+            new_bottom = thin if r == end_row else current.bottom
+            new_left = thin if c == start_col else current.left
+            new_right = thin if c == end_col else current.right
+            cell.border = Border(top=new_top, bottom=new_bottom, left=new_left, right=new_right)
+
+def _apply_outer_border(ws, start_row, start_col, end_row, end_col):
+    """
+    Applies borders ONLY to the outer edges of a range. 
+    Safe for ranges containing merged cells because it doesn't touch the interior.
+    """
+    from openpyxl.styles import Border, Side
+    thin = Side(border_style="thin", color="000000")
+    
+    # Top and bottom horizontal lines
+    for c in range(start_col, end_col + 1):
+        # Top edge
+        t = ws.cell(row=start_row, column=c)
+        t.border = Border(top=thin, left=t.border.left, right=t.border.right, bottom=t.border.bottom)
+        # Bottom edge
+        b = ws.cell(row=end_row, column=c)
+        b.border = Border(bottom=thin, left=b.border.left, right=b.border.right, top=b.border.top)
+        
+    # Left and right vertical lines
+    for r in range(start_row, end_row + 1):
+        # Left edge
+        l = ws.cell(row=r, column=start_col)
+        l.border = Border(left=thin, top=l.border.top, bottom=l.border.bottom, right=l.border.right)
+        # Right edge
+        ri = ws.cell(row=r, column=end_col)
+        ri.border = Border(right=thin, top=ri.border.top, bottom=ri.border.bottom, left=ri.border.left)
+
+def _populate_v2_summary_sheet(ws, q_list, rating_index, project_name, multi_method_data, eval_data=None, method_labels=None, show_points=True):
+    """
+    Populates the 'Project Summary Worksheet' - all 15 formatting issues fixed.
+    I-1..I-6: Instructions block header fill, row heights, font size, Note styling, closing border.
+    P-1..P-7: Title full-width, dynamic curr, identity table centered, dynamic row heights.
+    S-1..S-2: EVALUATION FACTORS border connector, method cols 12px.
+    """
+    s = _get_styles()
+    methods = method_labels if method_labels else ALL_METHODS
+
+    # Fix S-2: reduce method cols 15->12px to balance the wide label column
+    ws.column_dimensions['A'].width = 5
+    ws.column_dimensions['B'].width = 55
+    for ci in range(len(methods)):
+        col_idx = 3 + ci * 2
+        ws.column_dimensions[get_column_letter(col_idx)].width = 12.0
+        ws.column_dimensions[get_column_letter(col_idx + 1)].width = 12.0
+
+    # ── INSTRUCTIONS BLOCK ────────────────────────────────────────────────────
+    # Fix I-1: header with fill, covers full width
+    instr_hdr = ws.cell(row=1, column=1, value="INSTRUCTIONS")
+    instr_hdr.font = Font(bold=True, size=10)
+    instr_hdr.alignment = Alignment(horizontal="center", vertical="center")
+    instr_hdr.fill = s['header_fill_v2']
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=14)
+    ws.row_dimensions[1].height = 16
+
+    instructions = [
+        ("step", "1. On the Project Summary Worksheet, complete the date of the review, project name, and selection committee members."),
+        ("step", "2. Answer all questions on Worksheet 1. Record the score for each delivery method on the form as indicated."),
+        ("note", "   Note: if any one of the answers is \"No-Go,\" the delivery method need not be considered further for that project."),
+        ("step", "3. After all the questions are answered, total the score for each delivery system and transfer the totals to the Scoring Summary section on the Project Summary Worksheet."),
+        ("step", "4. Repeat steps 2 and 3 for Worksheet 2."),
+        ("step", "5. Total the scores from Worksheets 1 and 2 in the Scoring Summary section of the Project Summary Worksheet."),
+        ("step", "6. Select the project delivery method with the highest score and record any important selection committee comments in the space provided."),
+        ("note", "   Note: Complete one project delivery selection questionnaire for each unique project. If multiple project alternatives or subprojects are being considered, complete one questionnaire for each unique variation."),
+    ]
+
+    for i, (kind, text) in enumerate(instructions, 2):
+        cell = ws.cell(row=i, column=1, value=text)
+        is_note = (kind == "note")
+        # Fix I-3: font 9 (was 8); Fix I-5: Note lines italic grey
+        cell.font = Font(size=9, italic=is_note, color="595959" if is_note else "000000")
+        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="left")
+        # Fix I-4: light fill on all instruction rows
+        cell.fill = s['even_fill']
+        ws.merge_cells(start_row=i, start_column=1, end_row=i, end_column=14)
+        # Fix I-2: explicit row height
+        ws.row_dimensions[i].height = 13
+
+    # Fix I-6: close the instructions block with an outer border
+    last_instr_row = len(instructions) + 1
+    _apply_outer_border(ws, 1, 1, last_instr_row, 14)
+
+    # Fix P-2: dynamic curr, not hardcoded 12
+    curr = last_instr_row + 2
+
+    # ── TITLE ─────────────────────────────────────────────────────────────────
+    # Fix P-1: title spans full sheet width (was cols 4-10 only)
+    title_cell = ws.cell(row=curr, column=1, value="Project Delivery Selection Tool")
+    title_cell.font = Font(bold=True, size=14)
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    ws.row_dimensions[curr].height = 28
+    curr += 1
+
+    sub_cell = ws.cell(row=curr, column=1, value="Project Summary Worksheet")
+    sub_cell.font = Font(bold=True, size=11)
+    sub_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    ws.row_dimensions[curr].height = 20
+    curr += 2
+
+    # ── IDENTITY TABLE ────────────────────────────────────────────────────────
+    # Fix P-3: center the table on the sheet — labels cols 3-4, values cols 5-8
+    district = eval_data.get("district", "N/A") if eval_data else "N/A"
+    ea_num = eval_data.get("project_ea", "N/A") if eval_data else "N/A"
+    identity = [
+        ("Project Name:", project_name if project_name else "N/A"),
+        ("Project District:", district),
+        ("Project EA:", ea_num),
+        ("Date of Review:", datetime.date.today().strftime("%m/%d/%y")),
+    ]
+
+    id_start_row = curr
+    for label, val in identity:
+        # Fix P-7: row heights set dynamically per actual curr value
+        ws.row_dimensions[curr].height = 20
+        l_cell = ws.cell(row=curr, column=3, value=label)
+        l_cell.font = s['bold']
+        l_cell.fill = s['grey_fill']
+        # Fix P-4: right-aligned label in a narrower label region
+        l_cell.alignment = Alignment(horizontal="right", vertical="center")
+        ws.merge_cells(start_row=curr, start_column=3, end_row=curr, end_column=4)
+
+        v_cell = ws.cell(row=curr, column=5, value=val)
+        v_cell.alignment = Alignment(horizontal="left", vertical="center")
+        v_cell.font = Font(size=10)
+        ws.merge_cells(start_row=curr, start_column=5, end_row=curr, end_column=8)
+        curr += 1
+
+    _apply_outer_border(ws, id_start_row, 3, curr - 1, 8)
+
+    # Fix P-5: spaced disclaimer with explicit height
+    curr += 1
+    disc = ws.cell(row=curr, column=3, value="Review is based on AI evaluation of project documentation")
+    disc.font = Font(italic=True, size=9, color="595959")
+    disc.alignment = Alignment(horizontal="left", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=3, end_row=curr, end_column=8)
+    ws.row_dimensions[curr].height = 16
+    curr += 2
+
+    # ── SELECTION COMMITTEE ───────────────────────────────────────────────────
+    comm_start = curr
+    hdr = ws.cell(row=curr, column=3, value="Selection Committee Members:")
+    hdr.font = s['bold']
+    hdr.alignment = Alignment(horizontal="left", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=3, end_row=curr, end_column=8)
+    ws.row_dimensions[curr].height = 18
+    curr += 1
+
+    for i in range(5):
+        ws.row_dimensions[curr].height = 16
+        # Fix P-6: number cell has right border so it visually connects to the line
+        num = ws.cell(row=curr, column=3, value=f"{i + 1}.")
+        num.alignment = Alignment(horizontal="right", vertical="center")
+        num.border = Border(right=s['thin_side'], bottom=s['thin_side'])
+        line = ws.cell(row=curr, column=4, value="")
+        line.border = Border(bottom=s['thin_side'])
+        ws.merge_cells(start_row=curr, start_column=4, end_row=curr, end_column=8)
+        curr += 1
+
+    _apply_outer_border(ws, comm_start, 3, curr - 1, 8)
+    curr += 2
+
+    # ── SCORING SUMMARY TABLE ─────────────────────────────────────────────────
+    last_method_col = 3 + len(methods) * 2 - 1
+
+    # Score calculation using official Selection Matrix points (needed for WS subtotals even if hidden)
+    ws1_scores = {m: 0 for m in methods}
+    ws2_scores = {m: 0 for m in methods}
+    for q in q_list:
+        qid = q["id"]
+        sec = qid[0]
+        robj = rating_index.get(qid, {})
+        sel = robj.get("selected_rating", "B").upper()
+        for m in methods:
+            pts = get_selection_matrix_points(qid, m, sel, robj)
+            if pts is None:
+                pts = 0
+            if sec == "A":
+                ws1_scores[m] += pts
+            else:
+                ws2_scores[m] += pts
+
+    if show_points:
+        # HQ: Full Scoring Summary
+        sum_hdr = ws.cell(row=curr, column=1, value="SCORING SUMMARY")
+        sum_hdr.font = Font(bold=True, size=11)
+        sum_hdr.alignment = s['center']
+        sum_hdr.fill = s['header_fill_v2']
+        ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=last_method_col)
+        ws.row_dimensions[curr].height = 18
+        curr += 1
+
+        table_start_row = curr
+        ef = ws.cell(row=curr, column=1, value="EVALUATION FACTORS")
+        ef.font = s['bold']
+        ef.alignment = s['center']
+        ef.fill = s['grey_fill']
+        ef.border = Border(right=s['thin_side'], bottom=s['thin_side'])
+        ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
+        ws.row_dimensions[curr].height = 30
+
+        for ci, method in enumerate(methods):
+            col = 3 + ci * 2
+            hc = ws.cell(row=curr, column=col, value=method)
+            hc.font = s['bold']
+            hc.fill = s['grey_fill']
+            hc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            ws.merge_cells(start_row=curr, start_column=col, end_row=curr, end_column=col + 1)
+        curr += 1
+
+        summary_rows = [
+            ("Project Scope and Characteristic Score (Worksheet 1)", ws1_scores),
+            ("Success Criteria Score (Worksheet 2)", ws2_scores),
+            ("Total Score", None),
+        ]
+
+        for label, score_dict in summary_rows:
+            ws.row_dimensions[curr].height = 20
+            lc = ws.cell(row=curr, column=1, value=label)
+            lc.font = s['bold']
+            lc.alignment = Alignment(wrap_text=True, horizontal="left", vertical="center")
+            ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
+
+            for ci, m in enumerate(methods):
+                col = 3 + ci * 2
+                val = round(score_dict[m]) if score_dict else round(ws1_scores[m] + ws2_scores[m])
+                c = ws.cell(row=curr, column=col, value=val)
+                c.font = s['bold']
+                c.alignment = s['center']
+                if not score_dict:
+                    c.fill = s['grey_fill']
+                ws.merge_cells(start_row=curr, start_column=col, end_row=curr, end_column=col + 1)
+            curr += 1
+
+        _apply_outer_border(ws, table_start_row, 1, curr - 1, last_method_col)
+        curr += 1
+
+    # ── DESIGN SELECTION TABLE ────────────────────────────────────────────────
+    sel_hdr = ws.cell(row=curr, column=1, value="DESIGN SELECTION")
+    sel_hdr.font = Font(bold=True, size=11)
+    sel_hdr.alignment = s['center']
+    sel_hdr.fill = s['header_fill_v2']
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=last_method_col)
+    ws.row_dimensions[curr].height = 18
+    curr += 1
+
+    # Table header row
+    ds_start = curr
+    ds_hdr = ws.cell(row=curr, column=1, value="Delivery Method")
+    ds_hdr.font = s['bold']
+    ds_hdr.fill = s['grey_fill']
+    ds_hdr.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=7)
+
+    sel_cell = ws.cell(row=curr, column=8, value="Selection")
+    sel_cell.font = s['bold']
+    sel_cell.fill = s['grey_fill']
+    sel_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=8, end_row=curr, end_column=last_method_col)
+    ws.row_dimensions[curr].height = 20
+    curr += 1
+
+    for m in methods:
+        ws.row_dimensions[curr].height = 18
+        sc = ws.cell(row=curr, column=1, value="☐")
+        sc.font = Font(size=12)
+        sc.alignment = Alignment(horizontal="center", vertical="center")
+
+        mc = ws.cell(row=curr, column=2, value=m)
+        mc.font = Font(size=10)
+        mc.alignment = Alignment(horizontal="left", vertical="center")
+        ws.merge_cells(start_row=curr, start_column=2, end_row=curr, end_column=last_method_col)
+        curr += 1
+
+    _apply_outer_border(ws, ds_start, 1, curr - 1, last_method_col)
+    curr += 2
+
+    ws.cell(row=curr, column=1, value="Comments:").font = s['bold']
+    curr += 1
+    for _ in range(4):
+        ws.row_dimensions[curr].height = 16
+        ws.cell(row=curr, column=2).border = Border(bottom=s['thin_side'])
+        ws.merge_cells(start_row=curr, start_column=2, end_row=curr, end_column=last_method_col)
+        curr += 1
+
+    curr += 2
+    _v2_draw_questionnaire(ws, curr, q_list, rating_index, methods, ws1_scores, ws2_scores, show_points=show_points)
+
+
+
+def _v2_draw_questionnaire(ws, start_row, q_list, rating_index, methods, ws1_scores, ws2_scores, show_points=True):
+    s = _get_styles()
+    thin = s['thin_side']
+    curr = start_row
+    
+    # Worksheet 1
+    ws.cell(row=curr, column=1, value="WORKSHEET 1").font = s['bold']
+    ws.cell(row=curr, column=1).alignment = s['center']
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    curr += 1
+    ws.cell(row=curr, column=1, value="EVALUATION OF PROJECT SCOPE AND CHARACTERISTICS").font = s['bold']
+    ws.cell(row=curr, column=1).alignment = s['center']
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    curr += 1
+
+    # Points legend — explain the scoring formula once, right under the WS1 heading
+    legend = ws.cell(row=curr, column=1,
+        value="Scoring: Each question is rated A / B / C. "
+              "Points are assigned per the official Caltrans Selection Matrix. "
+              "Method with the highest total score is recommended. 'No-Go' disqualifies a method.")
+    legend.font = Font(italic=True, size=8, color="595959")
+    legend.alignment = Alignment(wrap_text=True, horizontal="left", vertical="center")
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    ws.row_dimensions[curr].height = 14
+    curr += 2
+
+    # Section A
+    s_cell = ws.cell(row=curr, column=1, value="Project Scope and Characteristic Criteria")
+    s_cell.font = s['bold']
+    s_cell.fill = s['header_fill_v2']
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
+    
+    # Method Headers
+    for ci, method in enumerate(methods):
+        col = 3 + ci*2
+        c = ws.cell(row=curr, column=col, value=method)
+        c.font = Font(bold=True, size=9)
+        c.fill = s['grey_fill']
+        c.alignment = Alignment(wrap_text=True, horizontal="center")
+        ws.merge_cells(start_row=curr, start_column=col, end_row=curr, end_column=col+1)
+    
+    _apply_outer_border(ws, curr, 1, curr, 3 + len(methods)*2 - 1)
+    curr += 2
+    
+    a_questions = [q for q in q_list if q['id'].startswith("A")]
+    for q in a_questions:
+        qid = q["id"]
+        robj = rating_index.get(qid, {})
+        sel_rating = robj.get("selected_rating", "B").upper()
+
+        start_r = curr
+        # Draw Question — merge cols 1+2 so the full 60px width is used and text wraps properly
+        q_cell = ws.cell(row=curr, column=1, value=f"{qid}. {q['question']}")
+        q_cell.font = s['bold']
+        q_cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
+        curr += 1
+
+        # Draw Options — also merge cols 1+2 so col B is not left empty
+        opts_rendered = 0
+        for opt_key, opt_label in [("A", "option_a"), ("B", "option_b"), ("C", "option_c")]:
+            opt_text = q.get(opt_label, "")
+            if opt_text:
+                opt_cell = ws.cell(row=curr, column=1, value=f"☐ {opt_key}. {opt_text}")
+                opt_cell.font = Font(size=8)
+                opt_cell.alignment = Alignment(wrap_text=True, vertical="top")
+                ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
+                curr += 1
+                opts_rendered += 1
+
+        # Total rows for this question (Question + Options)
+        end_r = curr - 1
+
+        for ci, method in enumerate(methods):
+            col = 3 + ci*2
+            # Calculate points using Selection Matrix
+            pts = get_selection_matrix_points(qid, method, sel_rating, robj)
+            if pts is None:
+                display_val = "No-Go"
+            elif show_points:
+                display_val = f"{sel_rating} ({pts})" if sel_rating else ""
+            else:
+                display_val = sel_rating if sel_rating else ""
+
+            # Merge BOTH sub-columns (col + col+1) horizontally AND all rows vertically
+            col_end = col + 1
+            ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
+
+            c = ws.cell(row=start_r, column=col, value=display_val)
+            c.font = s['bold']
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+            # Apply a COMPLETE outer border on every row/column edge of the merged region.
+            # For a 2-col wide merge: col=left edge, col_end=right edge.
+            # For each row: top row gets top border, bottom row gets bottom border.
+            # Both columns get left/right edges on every row in the range.
+            for r in range(start_r, end_r + 1):
+                is_top = (r == start_r)
+                is_bottom = (r == end_r)
+                # Left column of the merged pair
+                ws.cell(row=r, column=col).border = Border(
+                    left=thin,
+                    top=thin if is_top else None,
+                    bottom=thin if is_bottom else None,
+                )
+                # Right column of the merged pair
+                ws.cell(row=r, column=col_end).border = Border(
+                    right=thin,
+                    top=thin if is_top else None,
+                    bottom=thin if is_bottom else None,
+                )
+
+        curr += 1 # Spacer row
+
+    # SCORE Row for WS1 — label in col 2 (col 1 is only 5px narrow)
+    if show_points:
+        ws.cell(row=curr, column=2, value="Project Characteristics Subtotal (Total Questions A1-A10) — SCORE").font = Font(italic=True, size=9)
+        for ci, m in enumerate(methods):
+            col = 3 + ci*2
+            c = ws.cell(row=curr, column=col+1, value=round(ws1_scores[m]))
+            c.font = s['bold']
+            c.alignment = s['center']
+            c.border = Border(bottom=thin)
+    curr += 4
+
+    # Worksheet 2
+    ws.cell(row=curr, column=1, value="WORKSHEET 2").font = s['bold']
+    ws.cell(row=curr, column=1).alignment = s['center']
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    curr += 1
+    ws.cell(row=curr, column=1, value="EVALUATION OF SUCCESS CRITERIA").font = s['bold']
+    ws.cell(row=curr, column=1).alignment = s['center']
+    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=14)
+    curr += 2
+
+    other_sections = [
+        ("B", "Schedule Issues"),
+        ("C", "Opportunity for Innovation"),
+        ("D", "Quality Enhancement"),
+        ("E", "Cost Issues"),
+        ("F", "Staffing Issues")
+    ]
+    
+    for prefix, section_title in other_sections:
+        # Section title — merge cols 1+2 so it's readable despite narrow col A
+        sec_hdr = ws.cell(row=curr, column=1, value=f"{prefix} - {section_title}")
+        sec_hdr.font = s['bold']
+        ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
+        # Headers
+        for ci, method in enumerate(methods):
+            col = 3 + ci*2
+            c = ws.cell(row=curr, column=col, value=method)
+            c.font = Font(bold=True, size=8)
+            c.alignment = s['center']
+            ws.merge_cells(start_row=curr, start_column=col, end_row=curr, end_column=col+1)
+        curr += 1
+        
+        sec_questions = [q for q in q_list if q['id'].startswith(prefix)]
+        for q in sec_questions:
+            qid = q["id"]
+            robj = rating_index.get(qid, {})
+            sel_rating = robj.get("selected_rating", "B").upper()
+
+            start_r = curr
+            # Question text — merge cols 1+2 so col B is not empty and text wraps
+            q_cell = ws.cell(row=curr, column=1, value=f"{qid}. {q['question']}")
+            q_cell.font = s['bold']
+            q_cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
+            curr += 1
+
+            # Options — also merge cols 1+2
+            for opt_key, opt_label in [("A", "option_a"), ("B", "option_b"), ("C", "option_c")]:
+                opt_text = q.get(opt_label, "")
+                if opt_text:
+                    opt_cell = ws.cell(row=curr, column=1, value=f"☐ {opt_key}. {opt_text}")
+                    opt_cell.font = Font(size=8)
+                    opt_cell.alignment = Alignment(wrap_text=True, vertical="top")
+                    ws.merge_cells(start_row=curr, start_column=1, end_row=curr, end_column=2)
+                    curr += 1
+
+            # Total rows for this question
+            end_r = curr - 1
+
+            for ci, method in enumerate(methods):
+                col = 3 + ci*2
+                # Calculate points using Selection Matrix
+                pts = get_selection_matrix_points(qid, method, sel_rating, robj)
+                if pts is None:
+                    display_val = "No-Go"
+                elif show_points:
+                    display_val = f"{sel_rating} ({pts})" if sel_rating else ""
+                else:
+                    display_val = sel_rating if sel_rating else ""
+
+                # Merge BOTH sub-columns horizontally AND all rows vertically
+                col_end = col + 1
+                ws.merge_cells(start_row=start_r, start_column=col, end_row=end_r, end_column=col_end)
+
+                c = ws.cell(row=start_r, column=col, value=display_val)
+                c.font = s['bold']
+                c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+                # Complete outer border on every row/column edge of the merged region
+                for r in range(start_r, end_r + 1):
+                    is_top = (r == start_r)
+                    is_bottom = (r == end_r)
+                    ws.cell(row=r, column=col).border = Border(
+                        left=thin,
+                        top=thin if is_top else None,
+                        bottom=thin if is_bottom else None,
+                    )
+                    ws.cell(row=r, column=col_end).border = Border(
+                        right=thin,
+                        top=thin if is_top else None,
+                        bottom=thin if is_bottom else None,
+                    )
+
+            curr += 1 # Spacer row
+
+    # SCORE Row for WS2 — label in col 2
+    if show_points:
+        ws.cell(row=curr, column=2, value="Success Criteria Subtotal (Total questions B-F) — SCORE").font = Font(italic=True, size=9)
+        for ci, m in enumerate(methods):
+            col = 3 + ci*2
+            c = ws.cell(row=curr, column=col+1, value=round(ws2_scores[m]))
+            c.font = s['bold']
+            c.alignment = s['center']
+            c.border = Border(bottom=thin)
+        curr += 2
+
+        ws.cell(row=curr, column=2, value="TOTAL").font = s['bold']
+        for ci, m in enumerate(methods):
+            col = 3 + ci*2
+            c = ws.cell(row=curr, column=col+1, value=round(ws1_scores[m] + ws2_scores[m]))
+            c.font = s['bold']
+            c.fill = s['header_fill_v2']
+            c.alignment = s['center']
+            c.border = s['bdr']
+        curr += 2
+    else:
+        curr += 4
+
+def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_method=None, title=None, project_name=None, validation_data=None, show_points=True):
+    """
+    Individual method worksheet: 8-column layout.
+    ID | Criteria | AI Rating | District Override | Points | Confid. | Source Reasoning & Citation | Missing Info & Impact
+    """
+    s = _get_styles()
+    
+    # All styles accessed via s dict — no local aliases to prevent NameErrors
+
+    # 1. Header & Setup
+    ws.column_dimensions['A'].width = 6   # ID
+    ws.column_dimensions['B'].width = 55  # Criteria
+    ws.column_dimensions['C'].width = 10  # AI Rating
+    if show_points:
+        ws.column_dimensions['D'].width = 10  # Points
+        ws.column_dimensions['E'].width = 10  # Confid.
+        ws.column_dimensions['F'].width = 45  # Source Reasoning & Citation
+        ws.column_dimensions['G'].width = 50  # Missing Info & Impact
+        _col_pts = 4
+        _col_conf = 5
+        _col_src = 6
+        _col_miss = 7
+        _total_cols = 7
+    else:
+        ws.column_dimensions['D'].width = 10  # Confid.
+        ws.column_dimensions['E'].width = 45  # Source Reasoning & Citation
+        ws.column_dimensions['F'].width = 50  # Missing Info & Impact
+        _col_pts = None
+        _col_conf = 4
+        _col_src = 5
+        _col_miss = 6
+        _total_cols = 6
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=_total_cols)
+    title_cell = ws.cell(row=1, column=1, value=title if title else f"DETAILED EVALUATION: {single_method}")
+    title_cell.font = Font(bold=True, size=14)
+    title_cell.alignment = s['center']
+
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=_total_cols)
+    sub_cell = ws.cell(row=2, column=1, value=f"Project: {project_name}" if project_name else "")
+    sub_cell.alignment = s['center']
+
+    # 2. Table Headers
+    if show_points:
+        headers = ["ID", "EVALUATION CRITERIA", "AI RATING", "POINTS", "CONFID.",
+                   "SOURCE REASONING", "MISSING INFO & IMPACT"]
+    else:
+        headers = ["ID", "EVALUATION CRITERIA", "AI RATING", "CONFID.",
+                   "SOURCE REASONING", "MISSING INFO & IMPACT"]
+    for ci, h in enumerate(headers, 1):
+        c = ws.cell(row=4, column=ci, value=h)
+        c.font = s['bold']
+        c.fill = s['header_fill_v2']
+        c.alignment = s['center']
+        c.border = s['bdr']
+    
+    current_row = 5
+    
+            
+    for q in q_list:
+        qid = q["id"]
+        sec = qid[0]
+        robj = rating_index.get(qid, {})
+        sel_rating = robj.get("selected_rating", "").upper()
+        confidence = robj.get("confidence", 0.0)
+        
+        # Extract reasoning fields — source with citation, missing info with delivery impact
+        source_res = robj.get("source_reasoning", robj.get("extracted_evidence", "No evidence found"))
+        missing_res = robj.get("missing_info_reasoning", "None — all evidence present")
+        
+        start_row = current_row
+        
+        # ID and Criteria
+        ws.cell(row=current_row, column=1, value=qid).font = s['bold']
+        ws.cell(row=current_row, column=2, value=q["question"]).font = s['bold']
+        current_row += 1
+        
+        # Options
+        for opt_key, opt_label in [("A", "option_a"), ("B", "option_b"), ("C", "option_c")]:
+            opt_text = q.get(opt_label, "")
+            if not opt_text: continue
+            display_text = f"☐ {opt_key}. {opt_text}"
+            if single_method and show_points:
+                opt_pts = get_selection_matrix_points(qid, single_method, opt_key)
+                if opt_pts is None:
+                    display_text += " [No-Go]"
+                else:
+                    display_text += f" [{opt_pts} pts]"
+            
+            c_opt = ws.cell(row=current_row, column=2, value=display_text)
+            c_opt.font = Font(size=9)
+            c_opt.alignment = s['top_left']
+            c_opt.border = Border(left=s['thin_side'], right=s['thin_side'])
+            current_row += 1
+        
+        end_row = current_row - 1
+        
+        # Vertical Merging for ID and related columns
+        merge_cols = [1, 3, _col_conf, _col_src, _col_miss]
+        if _col_pts:
+            merge_cols.append(_col_pts)
+        for col in merge_cols:
+            if start_row != end_row:
+                ws.merge_cells(start_row=start_row, start_column=col, end_row=end_row, end_column=col)
+
+        # Rating Cell (C)
+        pts = get_selection_matrix_points(qid, single_method, sel_rating, robj)
+        if pts is None:
+            pts = 0
+
+        # Color coding for Rating
+        rating_color = "166534" if sel_rating == "A" else ("854D0E" if sel_rating == "B" else "991B1B")
+        c_rate = ws.cell(row=start_row, column=3, value=sel_rating)
+        c_rate.font = Font(bold=True, color=rating_color)
+        c_rate.alignment = s['center']
+        c_rate.border = s['bdr']
+
+        # Points Cell (only if show_points)
+        if _col_pts:
+            c_pts = ws.cell(row=start_row, column=_col_pts, value=pts)
+            c_pts.font = s['bold']
+            c_pts.alignment = s['center']
+            c_pts.border = s['bdr']
+
+        # Confidence Cell
+        c_conf = ws.cell(row=start_row, column=_col_conf, value=f"{confidence:.2f}")
+        c_conf.alignment = s['center']
+        c_conf.border = s['bdr']
+
+        # Source Reasoning
+        c_src = ws.cell(row=start_row, column=_col_src, value=source_res)
+        c_src.alignment = s['top_left']
+        c_src.border = s['bdr']
+        c_src.font = Font(size=9)
+
+        # Missing Info & Impact
+        c_miss = ws.cell(row=start_row, column=_col_miss, value=missing_res)
+        c_miss.alignment = s['top_left']
+        c_miss.border = s['bdr']
+        c_miss.font = Font(size=9)
+        
+        # Borders for Criteria column (B)
+        for r in range(start_row, end_row + 1):
+            ws.cell(row=r, column=2).border = Border(
+                left=s['thin_side'], 
+                right=s['thin_side'], 
+                top=s['thin_side'] if r == start_row else None, 
+                bottom=s['thin_side'] if r == end_row else None
+            )
+
+        current_row += 1 # Spacer
+    ws.column_dimensions["B"].width = 100
+
+
+def build_evaluation_excel_v2(
+    eval_data: dict,
+    recommendation: dict,
+    project_name: str,
+    template_path: str,
+    multi_method_data: dict = None,
+    validation_data: dict = None,
+    show_points: bool = True,
+) -> BytesIO:
+    """
+    Build V2 workbook:
+    - Keep the provided template sheet(s) as the summary presentation layer
+    - Add one detailed sheet per delivery method
+    """
+    # 1. Load or create workbook
+    try:
+        if str(template_path).lower().endswith(".xls") and not str(template_path).lower().endswith(".xlsx"):
+            import pandas as pd
+            xls = pd.ExcelFile(template_path, engine="calamine")
+            wb = openpyxl.Workbook()
+            wb.remove(wb.active)
+            for sheet_name in xls.sheet_names:
+                df = pd.read_excel(template_path, sheet_name=sheet_name, header=None, engine="calamine")
+                ws = wb.create_sheet(_safe_sheet_title(sheet_name))
+                for r_idx in range(df.shape[0]):
+                    for c_idx in range(df.shape[1]):
+                        val = df.iat[r_idx, c_idx]
+                        ws.cell(row=r_idx+1, column=c_idx+1, value=None if pd.isna(val) else val)
+        else:
+            wb = openpyxl.load_workbook(template_path) if os.path.exists(template_path) else openpyxl.Workbook()
+    except Exception as e:
+        logging.warning(f"Template load failed ({e}), using fresh workbook")
+        wb = openpyxl.Workbook()
+
+    # 2. Rebuild strictly from scratch for consistency
+    for ws in list(wb.worksheets):
+        wb.remove(ws)
+
+    ratings = eval_data.get("ratings", [])
+    rating_index = {r.get("question_id"): r for r in ratings}
+    
+    # 3. Evaluation Summary (The main overview)
+    summary_ws = wb.create_sheet("Evaluation Summary")
+    _populate_v2_summary_sheet(
+        summary_ws, RUBRIC_QUESTIONS, rating_index,
+        method_labels=ALL_METHODS,
+        project_name=project_name,
+        multi_method_data=multi_method_data,
+        eval_data=eval_data,
+        show_points=show_points,
+    )
+    
+    # 4. Detailed Method Sheets (The extensions)
+    SAFE_NAME_MAP = {
+        "Design-Bid-Build": "DBB",
+        "Design-Sequencing": "DS",
+        "Design-Build/Low-Bid": "DB-LB",
+        "Design-Build/Best-Value": "DB-BV",
+        "CM/GC": "CM-GC",
+        "Progressive Design-Build": "PDB"
+    }
+
+    for method in ALL_METHODS:
+        # Create a safe abbreviation for sheet names
+        short_name = SAFE_NAME_MAP.get(method, method[:10])
+        m_ws = wb.create_sheet(f"{short_name} Extension")
+        m_ws.freeze_panes = "C5"
+        
+        _populate_rubric_sheet(
+            m_ws, RUBRIC_QUESTIONS, rating_index,
+            single_method=method,
+            title=f"{method} Detailed Elaboration: {project_name}",
+            project_name=project_name,
+            validation_data=validation_data,
+            show_points=show_points,
+        )
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+

@@ -6,7 +6,9 @@ command: [
   "--server.port",
   "$DATABRICKS_APP_PORT",
   "--server.address",
-  "0.0.0.0"
+  "0.0.0.0",
+  "--server.headless",
+  "true"
 ]
 env:
   - name: DATABRICKS_MODEL_ENDPOINT
