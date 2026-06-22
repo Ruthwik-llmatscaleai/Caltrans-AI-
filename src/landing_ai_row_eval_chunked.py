@@ -26,15 +26,16 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from src.databricks_client import get_openai_client, MODEL_GPT4O, MODEL_GPT4_1
 
 load_dotenv()
 
-client = get_openai_client()
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-GPT_MODEL = MODEL_GPT4_1
-VISION_MODEL = MODEL_GPT4O
-FALLBACK_MODEL = MODEL_GPT4O
+# GPT-4.1: better instruction following + 20% cheaper input than gpt-4o
+GPT_MODEL = "gpt-4.1"
+# GPT-4o for vision (supports image inputs)
+VISION_MODEL = "gpt-4o"
+FALLBACK_MODEL = "gpt-4o-2024-11-20"
 
 # 8 categories per chunk → 4 API calls total (was 8 calls at chunk size 4)
 CHUNK_SIZE = 8
