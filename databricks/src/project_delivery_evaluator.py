@@ -466,8 +466,16 @@ EXAMPLE 3 - Question D3 (Warranties) with missing info:
 source_reasoning: "No direct evidence found in the document for this criterion."
 missing_info_reasoning: "The narrative does not discuss warranty or maintenance agreement plans. If warranties are planned, CM/GC and Design-Build methods would score higher as they facilitate negotiated warranty terms during preconstruction."
 selected_rating: "N/E"
-confidence: 0.90
-missing_info: true"""
+confidence: 0.15
+missing_info: true
+
+CONFIDENCE SCORING RULE:
+- Confidence reflects how certain you are about the CORRECT ANSWER to the question — NOT how sure you are that evidence is missing.
+- If you found a direct quote that clearly answers the question → high confidence (0.80–0.95).
+- If you found indirect/partial evidence and had to interpret → moderate confidence (0.40–0.74).
+- If the document does NOT contain evidence for this question (N/E) → LOW confidence (0.10–0.25), because you cannot be confident about what the correct rating should be.
+- If evidence exists but is ambiguous or conflicting → low confidence (0.20–0.39).
+In short: no evidence = no confidence. The confidence number answers "How sure am I about the right answer?" — and if you never found the answer, you cannot be sure."""
 
     exclusion = """IMPORTANT EXCLUSIONS:
 - Do NOT evaluate any content from appendix sections of the fact sheet. These vary by template:
