@@ -442,7 +442,7 @@ For each of the 25 questions, follow this chain-of-thought:
 CRITICAL ANTI-FABRICATION RULE:
 - If the document does NOT contain evidence for a question, source_reasoning MUST state ONLY: "No direct evidence found in the document for this criterion."
 - Do NOT pull from unrelated sections to justify a rating. Do NOT infer from general project characteristics that do not directly address the specific criterion.
-- Example of WRONG behavior: Question asks about procurement cost impact on bidders, AI references "project was approved for CMGC" — this does NOT answer the question about procurement cost.
+- Example of WRONG behavior: Question asks about procurement cost impact on bidders, AI references unrelated general project description (e.g., "the project is on Highway 101") — this does NOT answer the question about procurement cost. However, if the document states the project was approved for an alternative delivery method (e.g., CMGC), this IS relevant evidence for E4 because it implies procurement cost was already evaluated and found acceptable given project complexity — rate accordingly.
 - When evidence is absent, do NOT select a rating. Set selected_rating to "N/E" (No Evidence). This question will receive zero scoring weight and will be flagged for human review.
 
 For source_reasoning: ALWAYS quote the exact text from the document with its section, then state your inference. If no evidence exists, state "No direct evidence found in the document for this criterion." and STOP — do not elaborate with unrelated content.
