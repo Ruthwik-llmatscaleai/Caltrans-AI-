@@ -1621,15 +1621,6 @@ def build_evaluation_excel(eval_data: dict, recommendation: dict, project_name: 
             rc.font = Font(bold=True, color="854D0E")
         elif rating == "C":
             rc.font = Font(bold=True, color="991B1B")
-        # Color-code confidence cell (column F)
-        conf_val = r.get("confidence", 0)
-        cc = ws2.cell(row=ri, column=6)
-        if conf_val >= 0.75:
-            cc.font = Font(bold=True, color="166534")
-        elif conf_val >= 0.40:
-            cc.font = Font(color="854D0E")
-        else:
-            cc.font = Font(bold=True, color="991B1B")
 
     ws2.column_dimensions["A"].width = 6
     ws2.column_dimensions["B"].width = 50
@@ -2473,16 +2464,10 @@ def _populate_rubric_sheet(ws, q_list, rating_index, method_labels=None, single_
             c_pts.alignment = s['center']
             c_pts.border = s['bdr']
 
-        # Confidence Cell — color-coded per scoring rule
+        # Confidence Cell
         c_conf = ws.cell(row=start_row, column=_col_conf, value=f"{confidence:.2f}")
         c_conf.alignment = s['center']
         c_conf.border = s['bdr']
-        if confidence >= 0.75:
-            c_conf.font = Font(bold=True, color="166534")  # green — high
-        elif confidence >= 0.40:
-            c_conf.font = Font(color="854D0E")  # amber — moderate
-        else:
-            c_conf.font = Font(bold=True, color="991B1B")  # red — low/very low
 
         # Source Reasoning
         c_src = ws.cell(row=start_row, column=_col_src, value=source_res)
